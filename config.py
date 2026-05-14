@@ -11,7 +11,7 @@ from pathlib import Path
 class GeneratorConfig:
     """Immutable runtime configuration passed to all modules."""
 
-    total_rows: int = 10_000_000
+    total_rows: int = 100_000
     rows_per_chunk: int = 1_000
     seed: int = 42
     output_dir: Path = field(default_factory=lambda: Path.cwd())
@@ -37,4 +37,4 @@ class GeneratorConfig:
 
     def chunk_filename(self, chunk_index: int) -> Path:
         """Return the Path for a chunk file given its 1-based index."""
-        return self.output_dir / f"file_{chunk_index:03d}.txt"
+        return self.output_dir / f"eng_L_{chunk_index:03d}.txt"

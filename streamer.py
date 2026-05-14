@@ -105,7 +105,7 @@ def run(config: GeneratorConfig) -> None:
         filepath = config.chunk_filename(chunk_idx)
 
         with open(filepath, "w", encoding="utf-8", buffering=_IO_BUFFER_BYTES) as fh:
-            chunk_bar = _make_bar(chunk_size, f"file_{chunk_idx:03d}.txt", leave=False)
+            chunk_bar = _make_bar(chunk_size, f"eng_L_{chunk_idx:03d}.txt", leave=False)
 
             rows_written = 0
             for row in _take(row_stream, chunk_size):
