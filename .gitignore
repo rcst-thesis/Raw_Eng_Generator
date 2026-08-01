@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+
+# Generated datasets and run state
+eng_*.txt
+.seen_hashes.bin
+.seen_hashes.bin.tmp
+runs.log
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

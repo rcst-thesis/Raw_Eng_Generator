@@ -1,13 +1,21 @@
 """
-generator.py — Core sentence generation engine  (v3 — massively expanded)
+generator.py — Core sentence generation engine  (v5 — selectable categories)
 
-28 domains · 22 generation strategies · 3 difficulty tiers
-600 + dialogue pairs · 900 + standalone sentences
+48 domains · 30 generation strategies · 3 difficulty tiers
+650 + dialogue pairs · 1 100 + standalone sentences
 Paraphrase map of 80 + word swaps · Rolling MD5 deduplication cache
-New strategies: rhetorical_question, aphorism, anecdote_opener, list_sentence,
-                hypothetical, reported_speech, causal_chain, contrast_pair,
-                imperative, reflection, analogy, proverb_twist, future_tense,
-                enumeration, sensory, quote_attribution, definition, news_headline
+
+v5 adds topic selection. Every content source is addressable by name and
+grouped into user-facing categories (see categories.py), so a run can be
+restricted to e.g. school, animals, nature, or everyday conversation:
+
+    SentenceGenerator(seed=1, categories=["animals", "nature"])
+
+v5 also adds 14 domains (animals, nature, people, relationships, home life,
+clothing, jobs, celebrations, city places, farming, fitness, culture,
+business, parenting), matching standalone pools and dialogue sections, and
+fixes a substring bug in the safety filter that silently dropped ordinary
+words such as "skill".
 
 Output schema per row:  id,english_text
 """
@@ -17,8 +25,15 @@ from __future__ import annotations
 import hashlib
 import logging
 import random
+import re
+import struct
 from dataclasses import dataclass
-from typing import Generator, Optional
+from pathlib import Path
+from typing import Generator, Iterable, Optional, Sequence
+
+import categories as cat_registry
+from content_domains import EXTRA_DOMAINS
+from content_pools import EXTRA_DIALOGUE, EXTRA_POOLS
 
 logger = logging.getLogger(__name__)
 
@@ -371,6 +386,38 @@ FUTURE_STARTERS = [
     "When the next phase begins,", "As we move forward,",
     "Eventually,", "In the not-too-distant future,",
     "Once the groundwork is laid,", "As the situation evolves,",
+]
+
+# Self-contained clauses used to close a sentence after a conjunction.
+OUTCOME_CLAUSES = [
+    "the outcome was better than anyone expected.",
+    "the result was worth the effort.",
+    "it made a noticeable difference.",
+    "nobody complained about the extra work.",
+    "the whole thing went smoothly in the end.",
+    "it took longer than planned.",
+    "everyone agreed it was the right call.",
+    "the timing could not have been better.",
+    "there were still a few loose ends.",
+    "it turned out to be surprisingly simple.",
+    "the effort paid off almost immediately.",
+    "some people remained unconvinced.",
+    "the change was obvious within a week.",
+    "it saved a great deal of trouble later.",
+    "the difference was hard to miss.",
+    "there was very little left to fix afterwards.",
+]
+
+# Complete future verb phrases: the domain banks store past-tense verbs,
+# so future sentences take their verb from here instead.
+FUTURE_VERB_PHRASES = [
+    "will focus on", "is likely to prioritise", "may reconsider",
+    "could improve", "is expected to review", "will look closely at",
+    "plans to work on", "intends to revisit", "will depend heavily on",
+    "should be able to handle", "is preparing to take on",
+    "will keep an eye on", "is set to expand", "may struggle with",
+    "will gradually take over", "is going to need", "hopes to finish",
+    "will almost certainly change", "is likely to rely on",
 ]
 
 PROVERB_TWISTS = [
@@ -2116,7 +2163,954 @@ DOMAINS: dict[str, dict] = {
             "How do participatory art practices challenge traditional distinctions between artist and audience?",
         ],
     },
+
+    # ════════════════════════════════════════════════════════════════════════
+    # CONVERSATIONAL / REAL-LIFE INTERACTION DOMAINS  (v4 additions)
+    # ════════════════════════════════════════════════════════════════════════
+
+    "greetings": {
+        "subjects": [
+            "She", "He", "They", "I", "We", "My neighbour", "A stranger",
+            "The receptionist", "My colleague", "An old friend",
+            "The new student", "The hotel staff member", "A passerby",
+        ],
+        "verbs_b": ["said", "waved", "smiled", "nodded", "greeted", "called out", "welcomed"],
+        "verbs_i": ["introduced themselves to", "exchanged pleasantries with",
+                    "warmly acknowledged", "cheerfully greeted"],
+        "verbs_a": ["initiated a culturally appropriate greeting with",
+                    "extended a formal welcome to",
+                    "navigated the social protocol of greeting"],
+        "objects_b": ["good morning", "hello", "hi there", "good afternoon",
+                      "good evening", "a friendly wave", "a warm smile"],
+        "objects_i": ["a colleague they had not seen in months",
+                      "the new arrival at the office", "everyone in the room",
+                      "their host for the evening"],
+        "objects_a": ["the visiting delegation in accordance with local custom",
+                      "a distinguished guest with appropriate formality"],
+        "extras_b": ["at the front door.", "across the street.", "in the hallway.",
+                     "with a big smile.", "before class.", "as they passed by."],
+        "extras_i": ["after a long time apart.", "with great warmth.",
+                     "despite the language barrier.", "at the start of the meeting."],
+        "extras_a": ["following the formal introduction protocol.",
+                     "mindful of cross-cultural differences in greeting customs."],
+        "questions_b": [
+            "Good morning! How are you today?",
+            "Hi! Is this your first time here?",
+            "Hey, long time no see! How have you been?",
+            "Good afternoon! Are you well?",
+            "Hello! Do we know each other?",
+            "Nice to meet you! What is your name?",
+            "Good evening! Welcome!",
+            "Hi there! How is everything?",
+        ],
+        "questions_i": [
+            "It is so good to see you again — how have things been?",
+            "I do not think we have been formally introduced — my name is Tom.",
+            "How long has it been? It feels like forever since we last spoke.",
+            "Are you new here? I have not seen you around before.",
+        ],
+        "questions_a": [
+            "How do greeting customs differ across cultures and what misunderstandings can arise?",
+            "In what ways do first impressions during introductions shape long-term relationships?",
+        ],
+    },
+
+    "farewells": {
+        "subjects": [
+            "She", "He", "They", "We", "My friend", "The host",
+            "Everyone at the party", "My colleague", "The teacher",
+        ],
+        "verbs_b": ["said", "waved", "hugged", "called out", "texted"],
+        "verbs_i": ["bid farewell to", "said a warm goodbye to",
+                    "promised to stay in touch with", "parted ways with"],
+        "verbs_a": ["concluded the meeting with a formal farewell to",
+                    "arranged a future rendezvous with"],
+        "objects_b": ["goodbye", "see you later", "take care", "farewell",
+                      "bye for now", "goodnight", "see you soon"],
+        "objects_i": ["everyone before leaving the party",
+                      "their host after a wonderful evening",
+                      "their team at the end of a long project"],
+        "objects_a": ["their international partners at the conclusion of the summit"],
+        "extras_b": ["at the door.", "before getting in the car.", "with a hug.",
+                     "after the meal.", "at the airport.", "at the end of class."],
+        "extras_i": ["promising to call as soon as they arrived.",
+                     "with a heartfelt thank you for the hospitality.",
+                     "after exchanging contact details."],
+        "extras_a": ["having established a strong foundation for future collaboration."],
+        "questions_b": [
+            "Goodbye! It was so nice to see you.",
+            "Take care! Safe travels.",
+            "See you soon! Don't be a stranger.",
+            "Goodnight! Thanks for a lovely evening.",
+            "Bye for now! Let's do this again.",
+            "Safe journey! Let me know when you arrive.",
+            "It was great catching up — until next time!",
+            "See you tomorrow! Get some rest.",
+        ],
+        "questions_i": [
+            "It has been such a pleasure — we must do this again soon.",
+            "I had a wonderful time — thank you so much for having me.",
+            "Let's not leave it so long next time — it was great to catch up.",
+            "Take care of yourself — and please say hi to your family from me.",
+        ],
+        "questions_a": [
+            "How do farewell rituals vary across cultures?",
+            "What role do goodbyes play in maintaining long-term social bonds?",
+        ],
+    },
+
+    "asking_directions": {
+        "subjects": [
+            "A tourist", "The visitor", "My friend", "She", "He",
+            "A lost traveller", "The delivery driver", "We",
+            "An elderly gentleman", "A schoolchild",
+        ],
+        "verbs_b": ["asked", "stopped", "looked for", "checked", "needed", "found"],
+        "verbs_i": ["navigated to", "enquired about", "sought directions to",
+                    "tried to locate", "followed the signs to"],
+        "verbs_a": ["successfully navigated the unfamiliar streets to",
+                    "used contextual cues to orient themselves toward"],
+        "objects_b": [
+            "the nearest bus stop", "the train station", "the supermarket",
+            "the town centre", "the nearest toilet", "the hospital",
+            "the hotel", "the post office", "the pharmacy",
+        ],
+        "objects_i": [
+            "the nearest underground station", "the city hall",
+            "the tourist information centre", "the main square",
+            "the nearest ATM", "the museum entrance",
+        ],
+        "objects_a": [
+            "the conference venue in an unfamiliar city district",
+            "the embassy in a complex urban environment",
+        ],
+        "extras_b": [
+            "from a helpful local.", "using a map.", "on foot.",
+            "after getting lost.", "on the way there.",
+        ],
+        "extras_i": [
+            "despite not speaking the local language.",
+            "using a combination of gestures and a translation app.",
+            "after asking three different people.",
+        ],
+        "extras_a": [
+            "by cross-referencing digital and physical navigation tools.",
+        ],
+        "questions_b": [
+            "Excuse me, where is the nearest bus stop?",
+            "How do I get to the train station from here?",
+            "Is the supermarket far from here?",
+            "Can you point me to the nearest ATM?",
+            "Which way is the town centre, please?",
+            "Is there a pharmacy nearby?",
+            "How far is it to walk to the hotel?",
+            "Could you tell me where the post office is?",
+            "Is this the right way to the museum?",
+            "Am I going the right direction for the airport?",
+            "Where is the nearest underground station?",
+            "Can you show me on the map where we are now?",
+        ],
+        "questions_i": [
+            "Could you tell me the best way to get to the city centre from here?",
+            "Is it quicker to take the bus or walk to the station?",
+            "I am looking for the main market — is it within walking distance?",
+            "Could you help me? I think I may have taken the wrong turn.",
+            "How many stops is it on the metro to the old town?",
+        ],
+        "questions_a": [
+            "How do wayfinding systems in unfamiliar urban environments affect the experience of tourists?",
+            "What role does spatial language play in cross-cultural communication challenges?",
+        ],
+    },
+
+    "making_requests": {
+        "subjects": [
+            "She", "He", "I", "We", "My colleague", "The guest",
+            "A customer", "The student", "My friend", "A passerby",
+        ],
+        "verbs_b": ["asked", "requested", "needed", "wanted", "tried to get",
+                    "hoped to", "politely asked for"],
+        "verbs_i": ["formally requested", "sought permission for",
+                    "enquired about obtaining", "politely enquired whether"],
+        "verbs_a": ["submitted a formal request for",
+                    "navigated the appropriate channels to obtain"],
+        "objects_b": [
+            "a glass of water", "the bill", "some help", "directions",
+            "a pen", "some change", "a bag", "a receipt", "the menu",
+            "another portion", "the wifi password", "a moment of their time",
+        ],
+        "objects_i": [
+            "an extension on the deadline", "permission to leave early",
+            "a refund for the item", "a quieter table",
+            "a copy of the report", "an appointment with the manager",
+        ],
+        "objects_a": [
+            "an official accommodation for accessibility needs",
+            "a formal waiver of the standard processing fee",
+        ],
+        "extras_b": [
+            "very politely.", "with a smile.", "in a kind tone.",
+            "without any fuss.", "straight away.",
+        ],
+        "extras_i": [
+            "explaining the situation clearly.",
+            "in a calm and respectful manner.",
+            "after waiting patiently for assistance.",
+        ],
+        "extras_a": [
+            "through the appropriate formal channels.",
+            "following the standard complaint and request procedure.",
+        ],
+        "questions_b": [
+            "Could you help me, please?",
+            "Can I have the bill, please?",
+            "May I have a glass of water?",
+            "Could you pass me that, please?",
+            "Do you mind if I sit here?",
+            "Could you speak a little more slowly, please?",
+            "Is it possible to get some change?",
+            "Would you mind repeating that?",
+            "Can I borrow a pen?",
+            "Could you open the window, please?",
+            "Do you have a charger I could borrow?",
+            "Is it okay if I take one of these?",
+            "Can I get a receipt, please?",
+            "Could you call a taxi for me?",
+            "Would it be possible to swap seats?",
+        ],
+        "questions_i": [
+            "I was wondering if it would be possible to change my booking.",
+            "Would it be too much trouble to ask for a different room?",
+            "Could I possibly speak to someone in charge?",
+            "I would appreciate it if you could look into this for me.",
+            "Is there any chance we could reschedule the appointment?",
+        ],
+        "questions_a": [
+            "How do politeness strategies vary across languages when making requests?",
+            "What is the pragmatic function of hedging language in formal requests?",
+        ],
+    },
+
+    "small_talk": {
+        "subjects": [
+            "She", "He", "We", "My neighbour", "A colleague",
+            "Two strangers", "Old friends", "The couple at the next table",
+            "My classmate", "The person next to me on the train",
+        ],
+        "verbs_b": ["talked about", "mentioned", "discussed", "chatted about",
+                    "asked about", "commented on"],
+        "verbs_i": ["struck up a conversation about", "fell into easy conversation about",
+                    "found common ground discussing", "exchanged views on"],
+        "verbs_a": ["engaged in substantive informal discourse about",
+                    "navigated the social conventions of conversation around"],
+        "objects_b": [
+            "the weather", "the weekend", "the local area", "the news",
+            "a recent film", "the traffic", "their day", "the game last night",
+            "the long queue", "the summer heat",
+        ],
+        "objects_i": [
+            "their plans for the holidays", "a mutual friend they had not seen",
+            "their favourite places to eat locally",
+            "how quickly the year had passed",
+            "their thoughts on the new development nearby",
+        ],
+        "objects_a": [
+            "the broader societal shifts visible in everyday life",
+            "the nuanced interplay between local community identity and wider change",
+        ],
+        "extras_b": [
+            "over coffee.", "while waiting.", "in the lift.", "at the bus stop.",
+            "during the break.", "on the way in.", "while queuing.",
+        ],
+        "extras_i": [
+            "while waiting for the meeting to start.",
+            "over lunch in the canteen.",
+            "during a quiet moment between tasks.",
+        ],
+        "extras_a": [
+            "revealing a shared set of values beneath the surface.",
+            "in a way that gradually built genuine rapport.",
+        ],
+        "questions_b": [
+            "So, how has your day been so far?",
+            "Can you believe this weather we are having?",
+            "Did you have a good weekend?",
+            "Are you from around here?",
+            "Have you been waiting long?",
+            "Busy day, isn't it?",
+            "Are you heading into town?",
+            "I love your jacket — where did you get it?",
+            "Is this your first time here?",
+            "Did you catch the game last night?",
+            "It is getting cold, isn't it?",
+            "What a beautiful day it is today.",
+        ],
+        "questions_i": [
+            "I feel like the summer just flew by — did you manage to get away at all?",
+            "I keep meaning to try that new place on the high street — have you been?",
+            "How are you finding things here? Have you settled in well?",
+            "We must be the only two people not on our phones right now.",
+            "I have been meaning to ask — do you know anywhere good to eat nearby?",
+        ],
+        "questions_a": [
+            "What social functions does small talk serve in building community cohesion?",
+            "How do conversational norms around small talk differ across cultural contexts?",
+        ],
+    },
+
+    "apologies_gratitude": {
+        "subjects": [
+            "She", "He", "I", "We", "My friend", "The shop assistant",
+            "A colleague", "The manager", "The student", "A stranger",
+        ],
+        "verbs_b": ["apologised", "thanked", "said sorry", "appreciated",
+                    "was grateful", "acknowledged", "recognised"],
+        "verbs_i": ["expressed sincere gratitude for", "formally apologised for",
+                    "graciously acknowledged", "genuinely thanked"],
+        "verbs_a": ["offered a heartfelt and considered apology for",
+                    "demonstrated genuine appreciation for the support of"],
+        "objects_b": [
+            "the inconvenience", "the mistake", "the misunderstanding",
+            "the help", "the gift", "the kind gesture", "the delay",
+            "the effort", "the waiting", "the hospitality",
+        ],
+        "objects_i": [
+            "being late to the meeting", "the error in the report",
+            "the unhelpful response they had given",
+            "all the support during a difficult time",
+            "the incredibly thoughtful surprise",
+        ],
+        "objects_a": [
+            "the procedural failure that had caused significant inconvenience",
+            "the outstanding contribution that had gone previously unrecognised",
+        ],
+        "extras_b": [
+            "immediately.", "without being asked.", "with great sincerity.",
+            "straight away.", "in person.", "with a smile.",
+        ],
+        "extras_i": [
+            "taking full responsibility for the situation.",
+            "making sure it would not happen again.",
+            "and offering to make it right.",
+        ],
+        "extras_a": [
+            "and outlining the steps that would be taken to prevent recurrence.",
+            "in a manner befitting the gravity of the situation.",
+        ],
+        "questions_b": [
+            "I am so sorry about that!",
+            "Thank you so much, I really appreciate it.",
+            "I apologise for the wait.",
+            "That was so kind of you — thank you.",
+            "I am really sorry for any trouble I caused.",
+            "Thank you for being so patient with me.",
+            "I owe you one — thank you!",
+            "Please forgive me, I did not mean to.",
+            "You are too kind, thank you so much.",
+            "I cannot thank you enough.",
+            "I am sorry, that was my fault entirely.",
+            "What a lovely thing to do — thank you.",
+        ],
+        "questions_i": [
+            "I just wanted to say how much I appreciated your help the other day.",
+            "I am really sorry for how I handled that — it was not fair on you.",
+            "Please accept my apologies — I should have been in touch sooner.",
+            "Thank you from the bottom of my heart — it made such a difference.",
+            "I genuinely cannot thank you enough for what you did.",
+        ],
+        "questions_a": [
+            "How do apology rituals function differently across high-context and low-context cultures?",
+            "What psychological conditions make a genuine apology effective?",
+        ],
+    },
+
+    "phone_calls": {
+        "subjects": [
+            "She", "He", "I", "The caller", "My mum", "The receptionist",
+            "A customer", "My colleague", "The doctor's surgery", "We",
+        ],
+        "verbs_b": ["called", "phoned", "rang", "texted", "answered",
+                    "missed", "left a message", "hung up"],
+        "verbs_i": ["arranged over the phone", "confirmed by phone",
+                    "spoke at length with", "reached out to"],
+        "verbs_a": ["conducted a detailed telephone consultation with",
+                    "resolved the matter efficiently via telephone with"],
+        "objects_b": [
+            "a friend", "the doctor", "the office", "home",
+            "the helpline", "the restaurant", "the hotel",
+            "customer services", "directory enquiries",
+        ],
+        "objects_i": [
+            "to confirm the appointment", "to check on the order",
+            "to arrange a time to meet", "to ask about the booking",
+            "to follow up on the application",
+        ],
+        "objects_a": [
+            "the regulatory authority to dispute the decision",
+            "the legal team to clarify the terms of the agreement",
+        ],
+        "extras_b": [
+            "this morning.", "after dinner.", "on the way home.", "in a hurry.",
+            "without getting through.", "and left a voicemail.",
+        ],
+        "extras_i": [
+            "after being on hold for twenty minutes.",
+            "and managed to sort everything out.",
+            "speaking clearly despite the bad signal.",
+        ],
+        "extras_a": [
+            "following the prescribed escalation procedure.",
+            "ensuring all key points were documented for the record.",
+        ],
+        "questions_b": [
+            "Hello? Is this the right number for the surgery?",
+            "Hi, I would like to make an appointment, please.",
+            "Can I speak to someone about my order?",
+            "Sorry, could you say that again? The line is a bit bad.",
+            "Could you hold on for just a moment?",
+            "I will call you back in about ten minutes.",
+            "Sorry to bother you — do you have a minute?",
+            "Is now a good time to talk?",
+            "I think we got cut off — are you still there?",
+            "Could I leave a message for her?",
+            "What is the best number to reach you on?",
+            "I am returning your call from earlier.",
+            "Sorry, I missed your call — what did you need?",
+            "Can you speak up a little? I can barely hear you.",
+            "I will let you go — thanks for calling.",
+        ],
+        "questions_i": [
+            "Good morning, I was hoping to speak to someone in customer services.",
+            "I am calling to follow up on the email I sent last week.",
+            "Could I arrange a callback when someone is available?",
+            "I want to check that my message got through — I did not hear back.",
+            "I am having trouble hearing you — would it help to switch to video?",
+        ],
+        "questions_a": [
+            "How have telephone communication conventions evolved in the age of messaging apps?",
+            "What pragmatic strategies facilitate effective communication over poor telephone connections?",
+        ],
+    },
+
+    "restaurant_cafe": {
+        "subjects": [
+            "The customer", "We", "I", "My friend", "The waiter",
+            "The waitress", "The barista", "The chef", "The family",
+            "A couple", "The group at the next table",
+        ],
+        "verbs_b": ["ordered", "asked for", "tried", "enjoyed", "chose",
+                    "tasted", "paid for", "left", "sat at", "waited for"],
+        "verbs_i": ["recommended", "requested", "queried", "settled on",
+                    "complimented", "sent back", "asked about allergens in"],
+        "verbs_a": ["evaluated the tasting menu of",
+                    "enquired about the provenance of the ingredients in",
+                    "formally complained about the service at"],
+        "objects_b": [
+            "a coffee", "the lunch special", "a glass of water",
+            "the dessert menu", "a table for two", "the soup of the day",
+            "a sandwich", "a smoothie", "the breakfast", "a hot chocolate",
+        ],
+        "objects_i": [
+            "a table by the window", "the vegetarian option",
+            "a recommendation from the waiter", "the house special",
+            "something without nuts", "a doggy bag for the leftovers",
+        ],
+        "objects_a": [
+            "the chef's tasting menu paired with the sommelier's wine selection",
+            "a full account of the dish's allergen and nutritional content",
+        ],
+        "extras_b": [
+            "before the rush.", "after a long morning.", "with a friend.",
+            "for the first time.", "near the window.", "to take away.",
+        ],
+        "extras_i": [
+            "explaining they had a nut allergy.", "after a short wait.",
+            "and said it was the best they had ever tasted.",
+            "before the rest of the group arrived.",
+        ],
+        "extras_a": [
+            "citing a breach of the establishment's stated allergen policy.",
+            "as part of a formal review for a food publication.",
+        ],
+        "questions_b": [
+            "A table for two, please.",
+            "Could we see the menu?",
+            "What do you recommend?",
+            "Can I have a coffee, please?",
+            "Is this dish spicy?",
+            "Could we get some more water?",
+            "Can I have the bill, please?",
+            "Do you have a vegetarian option?",
+            "Is service included in the price?",
+            "Can I take this to go?",
+            "Does this contain any nuts?",
+            "Could we have a few more minutes to decide?",
+            "Excuse me, we have been waiting for quite a while.",
+            "This is absolutely delicious — please pass on our compliments.",
+            "Could I swap the chips for a salad?",
+        ],
+        "questions_i": [
+            "Do you have anything without gluten on the menu?",
+            "Could you tell me what is in the sauce?",
+            "We have a reservation under the name Davies for seven o'clock.",
+            "Would it be possible to have a high chair for the little one?",
+            "Could we move to a different table? It is quite noisy here.",
+        ],
+        "questions_a": [
+            "How do restaurant service conventions differ across cultural contexts?",
+            "What linguistic strategies are most effective when raising a complaint in a restaurant?",
+        ],
+    },
 }
+
+# ════════════════════════════════════════════════════════════════════════════
+# DAILY INTERACTION SENTENCE POOLS  (v4 — translator-app focus)
+# ════════════════════════════════════════════════════════════════════════════
+
+DAILY_GREETINGS: list[str] = [
+    # Morning / arrival
+    "Good morning! How are you today?",
+    "Good morning! Did you sleep well?",
+    "Good afternoon! How has your day been so far?",
+    "Good evening! Hope you had a lovely day.",
+    "Hi! Great to see you.",
+    "Hey! How are you getting on?",
+    "Hello there! Are you well?",
+    "Good to see you! How have you been?",
+    "Hi, I do not think we have met — my name is Sarah.",
+    "Nice to meet you! I have heard a lot about you.",
+    "Welcome! Please come in and make yourself at home.",
+    "Oh, hello! What a lovely surprise.",
+    "Hey, long time no see! You look great.",
+    "Good morning — lovely day, isn't it?",
+    "Hi! Is this seat taken?",
+    "Hello! Sorry, do you speak English?",
+    "Excuse me — hi! I just wanted to introduce myself.",
+    "Hi everyone! Thanks for coming.",
+    "Good to see you again — how long has it been?",
+    "Welcome back! We have missed you.",
+]
+
+DAILY_FAREWELLS: list[str] = [
+    "Goodbye! It was so lovely to see you.",
+    "Take care! Safe journey home.",
+    "See you soon! Don't be a stranger.",
+    "Goodbye for now — let's catch up again soon.",
+    "It was really great to meet you!",
+    "Goodnight! Thanks for a wonderful evening.",
+    "Bye! Give my love to the family.",
+    "See you tomorrow — get some rest!",
+    "Take care of yourself — speak soon.",
+    "It has been wonderful. Until next time!",
+    "Right, I had better get going. Thanks for everything.",
+    "Bye bye! Have a safe trip.",
+    "See you on the other side — good luck!",
+    "Thanks for having me — I had a fantastic time.",
+    "I will let you get on. Speak soon!",
+    "All the best! Keep in touch.",
+    "Safe travels! Let me know when you land.",
+    "Bye! It was great catching up.",
+    "Cheers! We should do this again.",
+    "Goodbye and good luck with everything.",
+]
+
+DAILY_INTRODUCTIONS: list[str] = [
+    "Hi, my name is James. What is yours?",
+    "Nice to meet you! Where are you from?",
+    "I do not think we have been introduced — I am Maria.",
+    "Hello! I am new here. Do you work in this building?",
+    "This is my friend Tom. He is visiting from abroad.",
+    "Let me introduce you to my colleague, Dr Chen.",
+    "I have heard so much about you — it is great to finally meet you.",
+    "I am the new person on the team — looking forward to working with everyone.",
+    "I am sorry, I have forgotten your name — could you remind me?",
+    "I am not sure we have met officially — I am the head of the project.",
+    "This is my partner, Alex.",
+    "May I introduce our guest speaker for this evening.",
+    "I think you know my sister — she mentioned you a few times.",
+    "Hi! I recognise you from the conference last year.",
+    "We have not spoken before, but I have seen you around the office.",
+]
+
+DAILY_SMALL_TALK: list[str] = [
+    "Can you believe this weather? It has been so unpredictable lately.",
+    "Have you done anything nice at the weekend?",
+    "It feels like everyone is on holiday right now.",
+    "How are you finding the new office?",
+    "I hear the traffic was terrible this morning.",
+    "Did you manage to watch the match last night?",
+    "It feels like ages since we last had a proper chat.",
+    "Are you keeping busy?",
+    "I cannot believe how fast this year is going.",
+    "Have you tried that new café on the corner?",
+    "The queues in town were something else today.",
+    "It is so good to finally have some sunshine.",
+    "I heard there is a new restaurant opening nearby.",
+    "Are you doing anything nice for the bank holiday?",
+    "I cannot stop thinking about the film I watched last night.",
+    "I keep meaning to try that recipe you mentioned.",
+    "The kids are off school this week — it has been a bit hectic.",
+    "Is it just me or has it been a really long week?",
+    "I have been meaning to ask — how did the interview go?",
+    "You look well! Have you been somewhere nice?",
+    "Any exciting plans coming up?",
+    "I finally got around to reading that book you recommended.",
+    "I have not had a minute to myself today.",
+    "The summer just flew by, didn't it?",
+    "Is everything okay? You seem a bit quiet today.",
+]
+
+DAILY_ASKING_DIRECTIONS: list[str] = [
+    "Excuse me, could you tell me the way to the train station?",
+    "Sorry to bother you — is there a pharmacy near here?",
+    "How do I get to the town centre from here?",
+    "Is this the right road for the airport?",
+    "Could you point me in the direction of the bus stop?",
+    "How far is it to the nearest underground station?",
+    "Is it walkable from here, or should I take a taxi?",
+    "Which platform is the train to London from?",
+    "Sorry, I am a bit lost — can you help?",
+    "Is there a supermarket around here?",
+    "Can I get there by bus or do I need to take the metro?",
+    "How many stops is it on the tube to the city centre?",
+    "Am I heading the right way for the old town?",
+    "Could you show me on the map where we are?",
+    "Is there a shortcut to the museum from here?",
+    "Where is the nearest cash machine?",
+    "Which exit should I take from the station for the hotel?",
+    "Do you know if there is a taxi rank nearby?",
+    "I am looking for the market square — any idea which direction?",
+    "Is this street one way? I keep getting confused.",
+    "Excuse me, does this bus go to the high street?",
+    "Could you tell me the name of this street? I am completely lost.",
+    "About how long does it take to walk from here to the beach?",
+    "Is the hospital far? I need to get there quickly.",
+    "Do I need to cross the bridge, or is there another way?",
+]
+
+DAILY_MAKING_REQUESTS: list[str] = [
+    "Could you help me with this, please?",
+    "Would you mind holding the door?",
+    "Can I borrow your pen for a second?",
+    "Could you speak more slowly, please? I am still learning the language.",
+    "Is it okay if I open the window?",
+    "Could you turn the music down a little?",
+    "Can you say that again? I did not quite catch it.",
+    "Would it be possible to change my seat?",
+    "Could you take a photo of us, please?",
+    "Is there any chance you could give me a hand?",
+    "Do you mind if I go ahead? I am in a bit of a rush.",
+    "Could I get a glass of tap water, please?",
+    "Would you be able to write that down for me?",
+    "Can I have a receipt, please?",
+    "Could you call a taxi for me?",
+    "Is it possible to get this translated?",
+    "Do you have a charger I could borrow for a few minutes?",
+    "Could you keep an eye on my bag for a moment?",
+    "Can I use the bathroom, please?",
+    "Would you mind swapping seats with me?",
+    "Could I have a bit more time to decide?",
+    "Is it possible to pay by card?",
+    "Could you check if this is correct, please?",
+    "Can you help me fill in this form?",
+    "Would you mind not smoking here?",
+]
+
+DAILY_APOLOGIES_GRATITUDE: list[str] = [
+    "I am so sorry — that was completely my fault.",
+    "I apologise for the confusion.",
+    "Sorry to keep you waiting.",
+    "I am really sorry, I had no idea.",
+    "Please forgive me — it will not happen again.",
+    "I owe you an apology for how I acted earlier.",
+    "Sorry about that! Are you all right?",
+    "I am so embarrassed — I am very sorry.",
+    "Apologies for the late reply.",
+    "Thank you so much — I really appreciate your help.",
+    "That is so kind of you, thank you.",
+    "I cannot thank you enough.",
+    "Thank you for being so patient with me.",
+    "You are very generous — thank you.",
+    "I am so grateful for everything you have done.",
+    "Thank you for going out of your way like that.",
+    "What a lovely thing to do — thank you so much.",
+    "I truly appreciate your time.",
+    "Thank you for thinking of me.",
+    "I owe you one — that was so helpful.",
+    "That means a lot to me — thank you.",
+    "I really do not know what I would have done without you.",
+    "Cheers! That was very kind.",
+    "Thank you from the bottom of my heart.",
+    "I am so grateful — you really saved me there.",
+]
+
+DAILY_PHONE_CALLS: list[str] = [
+    "Hello? Is this the right number for the appointments line?",
+    "Hi! Is now a good time to talk?",
+    "Sorry, I think we got cut off — are you still there?",
+    "Could you speak up? I can barely hear you.",
+    "I will call you back in about ten minutes.",
+    "Can I leave a message, please?",
+    "Sorry to bother you — do you have two minutes?",
+    "I am returning your call from this morning.",
+    "The signal is not great — can you hear me okay?",
+    "I just wanted to check you got my message.",
+    "I missed your call — is everything okay?",
+    "I will let you go — thanks for ringing.",
+    "Sorry, could you repeat the number? I did not get it all.",
+    "Hi! I am calling about the appointment I have tomorrow.",
+    "Could you hold on for just a second?",
+    "Hello, I would like to speak to someone about a billing query.",
+    "I am afraid she is not available at the moment — can I take a message?",
+    "Thanks for calling back so quickly.",
+    "Can I confirm that as a text message to this number?",
+    "I think there must be some confusion — let me explain from the beginning.",
+    "I am calling to follow up on the enquiry I made last week.",
+    "Is there a direct number I can use next time?",
+    "I am on hold — I will just wait.",
+    "Thanks for your help — have a lovely day!",
+    "I will send you an email to confirm everything we discussed.",
+]
+
+DAILY_RESTAURANT_CAFE: list[str] = [
+    "A table for two, please.",
+    "Do you have a table free without a reservation?",
+    "Could we have the menu, please?",
+    "What do you recommend today?",
+    "Is the soup of the day vegetarian?",
+    "Could I have a flat white, please?",
+    "I am allergic to nuts — is this dish safe for me?",
+    "Could we have some more bread, please?",
+    "Can I swap the fries for a side salad?",
+    "Could we have a high chair for the baby?",
+    "Excuse me, we have been waiting for quite a while.",
+    "This is delicious — please pass on our compliments to the chef.",
+    "Could I have the bill when you get a moment?",
+    "Is service included, or should we leave a tip separately?",
+    "Can I have this to take away?",
+    "Do you have oat milk as an alternative?",
+    "Could we move to a quieter table if there is one free?",
+    "I ordered the salmon but this looks like the chicken.",
+    "Could we have some extra napkins?",
+    "Is the kitchen still open or have you stopped serving?",
+    "We have a reservation for seven o'clock under the name Li.",
+    "Could you tell me what is in the sauce?",
+    "Can I see the dessert menu, please?",
+    "This is a bit cold — could it be warmed up?",
+    "We would like separate bills, please.",
+    "What is the dish of the day?",
+    "Do you do a set menu at lunchtime?",
+    "Sorry, could we cancel one of those orders?",
+    "It is our anniversary — could you do anything special?",
+    "We would love another round of drinks, please.",
+]
+
+DAILY_EXPRESSING_FEELINGS: list[str] = [
+    "I am really excited about this.",
+    "To be honest, I am a little nervous.",
+    "I cannot believe how happy I am right now.",
+    "I am feeling a bit overwhelmed at the moment.",
+    "I am not sure how I feel about this yet.",
+    "I have to say, I am really proud of what we achieved.",
+    "I am feeling much better, thank you for asking.",
+    "I am a little tired today — it has been a long week.",
+    "I feel really bad about what happened — I should have handled it differently.",
+    "I am absolutely thrilled — I could not have hoped for better news.",
+    "I am quite worried about how this will turn out.",
+    "To tell you the truth, I am a little disappointed.",
+    "I feel so relieved that everything worked out.",
+    "I am so touched that you remembered.",
+    "I find this really difficult to talk about, if I am honest.",
+    "I am genuinely moved by how kind everyone has been.",
+    "I feel very fortunate to be here.",
+    "I am a bit frustrated, but I know it will get sorted.",
+    "Honestly, I am just happy to be involved.",
+    "I cannot quite put my finger on it, but something feels off.",
+]
+
+DAILY_COMPLIMENTS: list[str] = [
+    "That looks really good on you.",
+    "You have done an amazing job with this.",
+    "I love what you have done with the place.",
+    "You are such a great listener.",
+    "That was incredibly well put.",
+    "I really admire how calm you stay under pressure.",
+    "You have a real talent for this.",
+    "That is one of the kindest things anyone has ever said to me.",
+    "Your cooking is absolutely wonderful.",
+    "I love the way you always make everyone feel welcome.",
+    "You have made such a difference — thank you.",
+    "That is genuinely impressive.",
+    "You have come such a long way — you should be proud.",
+    "I love your style.",
+    "You explain things so clearly — I always understand you.",
+    "This is some of the best work I have seen.",
+    "You have such a warm personality.",
+    "I really appreciate how much effort you put into things.",
+    "That was a brilliant idea.",
+    "You handled that really well.",
+]
+
+DAILY_MAKING_PLANS: list[str] = [
+    "Are you free this weekend?",
+    "We should meet up soon — it has been too long.",
+    "Shall we say seven o'clock at the usual place?",
+    "What are you up to on Saturday?",
+    "I was thinking we could all go for dinner — what do you think?",
+    "How does Thursday evening work for you?",
+    "Could we arrange a call sometime this week?",
+    "We are all going for drinks on Friday — fancy joining?",
+    "Let us pencil something in for next month.",
+    "Are you around over the bank holiday weekend?",
+    "We should plan a trip together — I have been thinking about it for ages.",
+    "Is next Tuesday too soon, or would you prefer later in the week?",
+    "How about we meet for lunch? My treat.",
+    "I will check my calendar and get back to you.",
+    "Shall we say the café on the corner at noon?",
+    "Does that time work for everyone, or shall we try a different day?",
+    "I will send you a calendar invite so it is locked in.",
+    "We could all go to that new place — I have heard good things.",
+    "Are you bringing anyone, or is it just you?",
+    "Let me know if plans change — we can always move it.",
+]
+
+DAILY_SHOPPING_PHRASES: list[str] = [
+    "Excuse me, do you have this in a medium?",
+    "How much is this, please?",
+    "Is this in the sale?",
+    "Do you price match with other shops?",
+    "I would like to return this — I have the receipt.",
+    "Can I try this on?",
+    "Where are the fitting rooms?",
+    "Do you have this in any other colours?",
+    "Is there a cheaper option that does something similar?",
+    "Do you offer a student discount?",
+    "I think this is faulty — could someone have a look?",
+    "Can I pay with my phone?",
+    "Do you have a loyalty card scheme?",
+    "I am just browsing, thank you.",
+    "Could you wrap this as a gift, please?",
+    "Do you know when this will be back in stock?",
+    "Is the online price the same as in store?",
+    "I ordered this online but it arrived damaged — what can I do?",
+    "Do you have any recommendations for a birthday gift?",
+    "Is there a self-checkout I can use?",
+]
+
+DAILY_TRANSPORT_PHRASES: list[str] = [
+    "Which platform does the train to Edinburgh leave from?",
+    "Is this bus going to the city centre?",
+    "One return to Manchester, please.",
+    "Can I get an all-day travel pass?",
+    "How often does this bus run?",
+    "Is there a direct service, or do I need to change?",
+    "I think I am on the wrong train — what should I do?",
+    "Could you tell me when we reach the stop for the museum?",
+    "Does this ticket cover the underground as well?",
+    "I have lost my travel card — who should I speak to?",
+    "Is there a left luggage facility at the station?",
+    "Can I take my bicycle on the train?",
+    "Where is the taxi rank, please?",
+    "How much is the fare to the airport roughly?",
+    "Could you drop me off at the corner, please?",
+    "Is there a bus stop near the hotel?",
+    "Does the ferry run on Sundays?",
+    "What time is the last train back tonight?",
+    "I have a rail card — does that reduce the price?",
+    "Is there step-free access at this station?",
+]
+
+DAILY_EMERGENCIES_HELP: list[str] = [
+    "Please help! I need a doctor.",
+    "Excuse me — is there a first aid kit nearby?",
+    "I have lost my wallet — what should I do?",
+    "My phone has been stolen — where is the nearest police station?",
+    "I do not feel well — is there somewhere I can sit down?",
+    "Please call an ambulance.",
+    "I am lost and I cannot find my group.",
+    "Excuse me, this person has collapsed — can someone help?",
+    "I have locked myself out of my room.",
+    "I cannot find my passport — I am panicking.",
+    "Is there an emergency exit nearby?",
+    "Could someone call the police, please?",
+    "I have had an accident — I need assistance.",
+    "Please, can anyone speak English here?",
+    "I am separated from my family — can you help me find them?",
+    "I need to find the embassy — it is urgent.",
+    "My bag has been taken — what do I do?",
+    "I do not understand the instructions — could someone explain?",
+    "Is there a pharmacist on duty?",
+    "I have missed my flight — who can help me?",
+]
+
+DAILY_NUMBERS_TIME_DATE: list[str] = [
+    "What time does the museum open?",
+    "The meeting is at half past two.",
+    "It is just gone quarter to four.",
+    "Could you tell me today's date?",
+    "My birthday is on the fourteenth of March.",
+    "The last bus leaves at eleven thirty.",
+    "We need to be there by eight o'clock at the latest.",
+    "It is about a twenty-minute walk from here.",
+    "The train takes approximately two and a half hours.",
+    "The shop closes at six on weekdays.",
+    "Check-in is from three o'clock in the afternoon.",
+    "The event runs from Friday to Sunday.",
+    "I have been waiting for over half an hour.",
+    "Our flight lands just after midnight.",
+    "The deadline is the end of this week.",
+    "Breakfast is served between seven and ten.",
+    "The next available appointment is in three weeks.",
+    "It costs eight fifty per adult.",
+    "The temperature is expected to reach thirty degrees tomorrow.",
+    "We set off at around half six in the morning.",
+]
+
+DAILY_ACCOMMODATION: list[str] = [
+    "I have a reservation under the name Patel.",
+    "Could I have a room with a sea view, please?",
+    "What time is checkout?",
+    "Is breakfast included in the price?",
+    "Could I have an extra pillow, please?",
+    "The shower in my room does not seem to be working.",
+    "Is there parking available at the hotel?",
+    "Could someone bring more towels to room three twelve?",
+    "Is the gym open to all guests?",
+    "Can I store my luggage after checkout?",
+    "I would like to extend my stay by one more night, if possible.",
+    "Is the wifi password the same as the one on the card?",
+    "Could you arrange a wake-up call for seven thirty?",
+    "There seems to be an issue with the key card to my room.",
+    "Is it possible to have a late checkout?",
+    "Where is the nearest laundry service?",
+    "Could you recommend somewhere nice to eat nearby?",
+    "The room is a bit cold — is there extra heating?",
+    "Is there a quiet room where I can take a call?",
+    "Could I have a taxi booked for six tomorrow morning?",
+]
+
+DAILY_POLITE_PHRASES: list[str] = [
+    "After you, please.",
+    "Please, go ahead — I insist.",
+    "Could you say that in a different way? I am not sure I understood.",
+    "I beg your pardon?",
+    "Would you mind speaking a little more slowly?",
+    "I am not sure I followed that — could you repeat it?",
+    "You are very welcome.",
+    "Not at all — it was my pleasure.",
+    "Please do not mention it.",
+    "Of course! Happy to help.",
+    "I am afraid I do not know, but let me find out for you.",
+    "Allow me.",
+    "By all means.",
+    "That is very kind of you.",
+    "I really could not say, but I would suggest asking at the desk.",
+    "Please make yourself comfortable.",
+    "Take your time — there is no rush.",
+    "It is no trouble at all.",
+    "I do not want to impose, but would it be possible…",
+    "Pardon me — I did not mean to interrupt.",
+]
 
 # ════════════════════════════════════════════════════════════════════════════
 # STANDALONE SENTENCE POOLS  (greatly expanded)
@@ -2529,398 +3523,760 @@ STANDALONE_SCIENCE_FACTS: list[str] = [
 # DIALOGUE PAIRS  (600+)
 # ════════════════════════════════════════════════════════════════════════════
 
+DIALOGUE_SECTIONS: dict[str, list[tuple[str, str]]] = {
+
+    # ── Classroom ───────────────────────────────────────────────────
+    'classroom': [
+        ("Could you explain that again, please?", "Of course, let me try a different approach."),
+        ("What page are we on?", "We are on page forty-two, near the bottom."),
+        ("Is this going to be graded?", "Yes, it counts towards your final mark."),
+        ("Can I work with a partner on this?", "Absolutely, just make sure you both contribute equally."),
+        ("Do we need to show our working?", "Yes, showing your steps is part of the assessment."),
+        ("Can I hand it in tomorrow instead?", "I can give you one extra day, but no later than that."),
+        ("I do not understand the question.", "Let me rephrase it in a simpler way for you."),
+        ("Is there a word limit for this essay?", "Aim for between five hundred and eight hundred words."),
+        ("Will this topic come up in the exam?", "It is worth knowing, so I would definitely revise it."),
+        ("Can I borrow your notes?", "Sure, but make sure you return them before Friday."),
+        ("When is the next assignment due?", "You have until the end of next week."),
+        ("Is it okay to use online sources?", "Yes, as long as you cite them properly."),
+        ("Can we discuss this in groups?", "That is a great idea — give yourselves ten minutes."),
+        ("What does this term mean?", "It refers to the process of breaking something down into its parts."),
+        ("Should I include an introduction?", "Yes, always start with a clear introduction."),
+        ("How many references do we need?", "At least five, and they should be from academic sources."),
+        ("Is it better to use first person or third person?", "Third person is more formal and usually preferred for academic writing."),
+        ("Can you check my draft before I submit it?", "Leave it with me and I will have a look by tomorrow."),
+        ("What happens if I miss the deadline?", "There is a late penalty, so it is better to submit something than nothing."),
+        ("Should we write a conclusion?", "Yes, and it should do more than simply repeat what you have already said."),
+    ],
+
+    # ── Workplace ───────────────────────────────────────────────────
+    'workplace': [
+        ("Have you finished the report?", "Almost — I just need to check the final figures."),
+        ("Do you think we should try a different method?", "That is a good idea — let us discuss it as a team."),
+        ("Can you help me understand this diagram?", "Sure, let me walk you through it step by step."),
+        ("Is the meeting still on for tomorrow?", "Yes, same time and same room."),
+        ("Do you prefer working in a team or alone?", "It depends on the task, but I enjoy both."),
+        ("Could you clarify the deadline for this?", "It needs to be done by close of business on Friday."),
+        ("Should I copy the manager on this email?", "Yes, it is good to keep them in the loop."),
+        ("How do we handle this client complaint?", "We acknowledge it quickly and offer a clear resolution."),
+        ("Can you take notes during the meeting?", "No problem, I will send the summary by end of day."),
+        ("I think there is a mistake in the report.", "Let me have a look — can you point out the section?"),
+        ("Is the deadline flexible?", "Not really — the client is expecting it on Thursday."),
+        ("Who is leading the project now?", "It has been reassigned to the senior team."),
+        ("Can we get an update on the budget?", "I will pull the figures and share them before noon."),
+        ("Should we loop in the design team?", "Good point — I will send them a message right away."),
+        ("What is our top priority this week?", "Finishing the client presentation takes precedence."),
+        ("Should we set up a weekly check-in?", "That sounds useful — I will send a recurring invite."),
+        ("Who should sign off on this?", "It needs to go through the head of department first."),
+        ("Can we move the standup to a different time?", "What time works better for you — I can adjust it."),
+        ("How do we handle scope creep on this project?", "We document every change request and get written approval before proceeding."),
+        ("What is the best way to escalate this?", "Email the line manager with a clear summary and proposed next steps."),
+    ],
+
+    # ── Technology ──────────────────────────────────────────────────
+    'technology': [
+        ("Why is my internet so slow today?", "It might be worth restarting your router."),
+        ("How do I recover a deleted file?", "Check the recycle bin first — it may still be there."),
+        ("What is the difference between saving and exporting?", "Saving keeps it in the original format; exporting converts it."),
+        ("Is it safe to click on this link?", "If you do not recognise the sender, I would avoid it."),
+        ("My laptop keeps overheating — what should I do?", "Make sure the vents are clear and try a cooling pad."),
+        ("How do I set up two-factor authentication?", "Go to your account settings and look for the security section."),
+        ("Should I update the software now or later?", "It is best to update soon — patches often fix security issues."),
+        ("Can I share my screen with the team?", "Yes, just click the share button at the bottom of the window."),
+        ("Why does the app keep crashing?", "Try clearing the cache or reinstalling the latest version."),
+        ("Is cloud storage actually secure?", "It depends on the provider, but reputable services use strong encryption."),
+        ("How do I free up space on my phone?", "Delete unused apps and move photos to cloud storage."),
+        ("What is a VPN and do I need one?", "It encrypts your connection — useful on public networks."),
+        ("How do I stop getting so many spam emails?", "Use your email filter and unsubscribe from unwanted lists."),
+        ("Can I use this laptop offline?", "Yes, most applications will work without an internet connection."),
+        ("What is the difference between a virus and malware?", "Malware is the broader category — a virus is one specific type."),
+        ("How do I back up my files automatically?", "Set up cloud sync or schedule a regular backup with your operating system."),
+        ("Why did my computer slow down after the update?", "Sometimes updates require a restart to complete — try rebooting first."),
+        ("What is the safest browser to use?", "Most modern browsers are comparable — keeping it updated matters more."),
+        ("How do I share a large file with someone?", "Use a cloud service like a shared folder link rather than email attachment."),
+        ("Should I use the same password for everything?", "No — use a password manager and a unique password for each account."),
+    ],
+
+    # ── Healthcare ──────────────────────────────────────────────────
+    'healthcare': [
+        ("Are you feeling better today?", "A little, thank you — the rest really helped."),
+        ("Did you take your medicine this morning?", "Yes, I took it right after breakfast."),
+        ("Should I go to the doctor or wait and see?", "If it has lasted more than three days, I would get it checked."),
+        ("Is it safe to exercise when you are sick?", "Light walking is usually fine, but avoid anything intense."),
+        ("How long do I need to fast before the blood test?", "Typically eight to twelve hours — water is fine to drink."),
+        ("Can I take both of these tablets at the same time?", "Check with your pharmacist to be sure there are no interactions."),
+        ("What should I eat when I have an upset stomach?", "Plain food like rice, toast, and bananas is usually gentle."),
+        ("How do I know if I am dehydrated?", "Dark urine, dry mouth, and feeling dizzy are common signs."),
+        ("Is it normal to feel tired after starting this medication?", "Yes, fatigue can be a short-term side effect — it usually passes."),
+        ("When should I see a specialist instead of my GP?", "Your GP will refer you if they think specialist care is needed."),
+        ("How long will the recovery take?", "It varies, but most people feel better within a week or two."),
+        ("Should I avoid any foods while taking this?", "Yes, check the leaflet — some medications interact with certain foods."),
+        ("Can I drive while taking this medication?", "Check whether drowsiness is listed as a side effect — if so, avoid driving."),
+        ("Is this dosage right for my age?", "Your GP will have calculated it based on your specific details."),
+        ("How do I know if the treatment is working?", "Your symptoms should gradually improve — go back if they worsen."),
+        ("Should I rest completely or stay gently active?", "Gentle movement is usually better than complete bed rest for most conditions."),
+        ("Can stress make physical symptoms worse?", "Yes, stress has well-documented effects on the immune and digestive systems."),
+        ("Is it okay to stop the antibiotics early if I feel better?", "No — always complete the full course to avoid antibiotic resistance."),
+        ("What is the difference between a cold and the flu?", "Flu typically has a sudden onset and includes fever, body aches, and fatigue."),
+        ("How much water should I be drinking each day?", "Around two litres is a general guide, though individual needs vary."),
+    ],
+
+    # ── Travel ──────────────────────────────────────────────────────
+    'travel': [
+        ("What is the best time of year to visit?", "Spring and autumn are usually the most pleasant seasons there."),
+        ("How long is the flight?", "It is about eleven hours with one connection."),
+        ("Do I need to book tours in advance?", "For popular attractions, definitely — they sell out quickly."),
+        ("What currency do they use there?", "They use the local currency, so exchange some before you leave."),
+        ("Is the tap water safe to drink?", "In most major cities, yes — but check for the specific region."),
+        ("How do I get from the airport to the city centre?", "There is a direct train that runs every twenty minutes."),
+        ("Should I get travel insurance?", "Always — it is worth it for peace of mind."),
+        ("What is the local food like?", "It is absolutely delicious and very affordable."),
+        ("Is it easy to get around without speaking the language?", "In tourist areas, many people speak English — apps help too."),
+        ("How many days would you recommend for this city?", "Three to four days gives you a good feel for it."),
+        ("Can I use my phone there without extra charges?", "Check with your network provider about international roaming."),
+        ("Is it safe to travel there at the moment?", "It is worth checking the latest travel advisory before you go."),
+        ("What should I do if I lose my passport?", "Contact your embassy or consulate immediately — they can help quickly."),
+        ("How do I avoid tourist traps?", "Walk a few streets away from the main squares and eat where locals do."),
+        ("Is it worth hiring a car?", "Only if you plan to travel outside the city — public transport is fine for most."),
+        ("What are the visa requirements?", "It depends on your nationality — check the official government website."),
+        ("Should I tip in restaurants?", "Tipping customs vary — in some countries it is expected, in others unusual."),
+        ("How do I stay safe when travelling alone?", "Share your itinerary with someone at home and keep valuables out of sight."),
+        ("What is the best way to deal with jet lag?", "Stay awake until local bedtime and get outside in natural light."),
+        ("Are there any cultural customs I should know about?", "Dressing modestly and removing shoes in certain spaces are common requirements."),
+    ],
+
+    # ── Food ────────────────────────────────────────────────────────
+    'food': [
+        ("What is the recipe for this?", "It is actually quite simple — I will write it down for you."),
+        ("How do you know when the pasta is ready?", "Taste it — it should be soft but still have a slight bite."),
+        ("Can I substitute something for the cream?", "Coconut milk works really well as an alternative."),
+        ("Why did my cake come out flat?", "The baking powder might have been expired or the oven too cool."),
+        ("How spicy is this dish?", "It has a gentle warmth, but nothing too intense."),
+        ("Should I let the meat rest before cutting it?", "Yes, a few minutes of resting keeps the juices in."),
+        ("What herbs go well with chicken?", "Rosemary, thyme, and tarragon are all excellent choices."),
+        ("How long does this keep in the fridge?", "Up to three days if stored in an airtight container."),
+        ("Is this dish vegetarian?", "Yes, it contains no meat or fish."),
+        ("What wine would pair well with this?", "A light white would complement the flavours nicely."),
+        ("How do I stop onions from making me cry?", "Try chilling them first or cutting near running water."),
+        ("Is it better to use butter or oil for this?", "Butter adds richness; oil works better at higher temperatures."),
+        ("Can I freeze this after cooking?", "Yes, let it cool completely first and freeze within two hours."),
+        ("How do I get the bread to form a crust?", "Place a tray of water in the oven — the steam helps the crust develop."),
+        ("Why is my sauce too thin?", "Simmer it longer without a lid to let the liquid reduce."),
+        ("What is the easiest way to peel garlic?", "Crush it with the flat of a knife — the skin comes off easily."),
+        ("How do I season a cast iron pan?", "Coat it lightly with oil and bake it upside down for an hour."),
+        ("Can I use dried herbs instead of fresh?", "Yes, but use about a third of the quantity as dried are more concentrated."),
+        ("What is the best oil for high-heat cooking?", "Oils with a high smoke point, like avocado or refined coconut oil."),
+        ("How do I know if the fish is fresh?", "It should smell like the sea, not strongly fishy, and the flesh should be firm."),
+    ],
+
+    # ── Shopping ────────────────────────────────────────────────────
+    'shopping': [
+        ("Do you have this in a larger size?", "Let me check the stockroom — I will be right back."),
+        ("Is there a sale on at the moment?", "Yes, twenty percent off selected items until Sunday."),
+        ("Can I return this if it does not fit?", "Yes, within thirty days with the receipt."),
+        ("How long does delivery take?", "Standard delivery is three to five working days."),
+        ("Is this covered by a warranty?", "It comes with a one-year manufacturer's warranty."),
+        ("Can I pay in instalments?", "Yes, we offer an interest-free payment plan."),
+        ("Do you offer gift wrapping?", "Yes, it is available at the checkout for a small additional charge."),
+        ("Is the price negotiable?", "I can offer you a small discount if you are buying two."),
+        ("How do I track my order?", "You will receive an email with a tracking link once it ships."),
+        ("Do you have a student discount?", "Yes, show your student ID for ten percent off."),
+        ("Can I collect this in store instead?", "Yes, click and collect is available at most of our branches."),
+        ("What happens if it arrives damaged?", "Contact us within forty-eight hours and we will arrange a replacement."),
+        ("Is this item in stock?", "I can see we have three left — shall I reserve one for you?"),
+        ("Can I place an order over the phone?", "Yes, I can take your details now if you would like to proceed."),
+        ("Is there a minimum spend for free delivery?", "Free delivery applies to orders over thirty pounds."),
+        ("Do you price match with other retailers?", "Yes, bring us the lower price and we will match it."),
+        ("Can I exchange this for a different colour?", "Of course, as long as we have your size in stock."),
+        ("What is the easiest way to cancel my order?", "Log into your account and select cancel — it only takes a moment."),
+        ("Is there a loyalty scheme I can join?", "Yes, sign up in store today and earn points on every purchase."),
+        ("How do I know which size to order?", "Our size guide is on the product page — it is very detailed."),
+    ],
+
+    # ── Weather ─────────────────────────────────────────────────────
+    'weather': [
+        ("Should I bring a jacket?", "Definitely — it is forecast to turn cold this afternoon."),
+        ("Is the storm going to be bad?", "They are expecting heavy rain and strong winds by evening."),
+        ("What is the weather like there in July?", "It is warm and sunny, occasionally with an afternoon shower."),
+        ("Why is it so humid today?", "A warm front has moved in from the south overnight."),
+        ("Will the snow cause any travel disruptions?", "Some routes may be affected — check updates before you leave."),
+        ("Is it safe to drive in these conditions?", "Visibility is poor, so drive slowly and leave extra distance."),
+        ("Why does the weather change so quickly here?", "The proximity to the coast makes conditions quite unpredictable."),
+        ("Do you think it will clear up by the afternoon?", "The forecast suggests a break in the clouds around three."),
+        ("How do meteorologists predict the weather?", "They use data from satellites, weather stations, and computer models."),
+        ("Is this weather normal for this time of year?", "It is a bit unusual — temperatures are running slightly above average."),
+        ("How accurate are seven-day forecasts?", "Reasonably accurate for the first three days, less so beyond that."),
+        ("What causes fog to form?", "When moist air near the ground cools rapidly, the water vapour condenses."),
+        ("Will there be a frost tonight?", "There is a chance — temperatures are forecast to drop to just below zero."),
+        ("Why does the wind feel colder than the actual temperature?", "Wind chill makes the air feel colder by drawing heat away from the skin faster."),
+        ("Is this the wettest summer on record?", "It is among the wettest in recent decades, according to the latest figures."),
+    ],
+
+    # ── Family ──────────────────────────────────────────────────────
+    'family': [
+        ("Are you going to your parents' place this weekend?", "Yes, it is my mum's birthday so we are all getting together."),
+        ("How are the kids settling into their new school?", "Really well — they have already made some good friends."),
+        ("Does everyone in your family live nearby?", "Most of us do, though my brother is abroad at the moment."),
+        ("How do you manage the school run with two jobs?", "We take turns — it takes some planning but it works."),
+        ("What do you do for family holidays?", "We usually go somewhere coastal — simple and relaxing."),
+        ("Do your children enjoy reading?", "My youngest is obsessed with books at the moment."),
+        ("How do you handle screen time with young children?", "We have set agreed times and stick to them fairly well."),
+        ("Did your parents teach you to cook?", "My grandmother was the one who really got me into it."),
+        ("How often do you visit your family?", "We try to get together at least once a month."),
+        ("What is your family's favourite tradition?", "We always have a big meal together on Sunday afternoons."),
+        ("How do you balance everyone's different schedules?", "A shared calendar helps enormously — we all update it as we go."),
+        ("Do you have family rituals around the holidays?", "We always go for a walk on the morning of each holiday, whatever the weather."),
+        ("How do you deal with disagreements within the family?", "We try to talk things through calmly and give everyone a chance to be heard."),
+        ("What do your children want to be when they grow up?", "This week, one wants to be a vet and the other an astronaut."),
+        ("How did you decide on your children's names?", "We each had a list and worked through them until we found the one we both loved."),
+    ],
+
+    # ── Hobbies ─────────────────────────────────────────────────────
+    'hobbies': [
+        ("How did you get into painting?", "A friend bought me a starter kit and I was hooked instantly."),
+        ("How long have you been playing the guitar?", "About three years now — I still practice every day."),
+        ("Do you write fiction or non-fiction?", "Mostly fiction, though I dabble in essays occasionally."),
+        ("Is photography expensive to get into?", "It can be, but starting with a smartphone is perfectly fine."),
+        ("What got you into hiking?", "A colleague convinced me to join a short trail walk — I was sold."),
+        ("Do you knit or crochet?", "Both, actually — they use different techniques but complement each other."),
+        ("Have you ever sold your artwork?", "Yes, I have sold a few pieces through a local gallery."),
+        ("What kind of music do you play?", "Mostly jazz, but I enjoy classical pieces too."),
+        ("How do you find time for your hobbies?", "I wake up an hour earlier — mornings are peaceful for creative work."),
+        ("What is the hardest thing about learning a new instrument?", "Staying consistent in the early stages when progress feels slow."),
+        ("Do you do any outdoor hobbies?", "Yes, I cycle at weekends and do a bit of gardening."),
+        ("Have you tried any creative writing?", "I write short stories in my spare time — nothing serious yet."),
+        ("What made you start collecting things?", "A single find at a car boot sale — then I could not stop."),
+        ("Do you exhibit your work anywhere?", "I have taken part in a couple of open studio events."),
+        ("How do you stay motivated when a project stalls?", "I give it a few days and come back with fresh eyes."),
+        ("Is pottery harder than it looks?", "Absolutely — but the learning curve makes it all the more satisfying."),
+        ("Have you entered any competitions?", "Yes, a local photography one — I did not win but it was a great experience."),
+        ("What equipment do you recommend for a beginner?", "Start with the basics and only invest in more as you grow into the hobby."),
+        ("How has your hobby changed over the years?", "It has become more intentional — less about output, more about process."),
+        ("Do you follow any artists or makers for inspiration?", "Several — I find social media genuinely useful for creative discovery."),
+    ],
+
+    # ── Gaming ──────────────────────────────────────────────────────
+    'gaming': [
+        ("What game are you playing at the moment?", "A really good open-world adventure — I have put hours into it."),
+        ("Do you prefer single-player or multiplayer?", "Single-player for the story, multiplayer for the social side."),
+        ("Is that game difficult?", "The early levels ease you in, but it gets quite challenging later on."),
+        ("Do you stream your gameplay?", "I have done a little, but I mostly play just for the enjoyment."),
+        ("What makes a game truly memorable?", "A great story, satisfying mechanics, and a world worth exploring."),
+        ("How do speedrunners get so fast?", "They study every frame of the game to find the most efficient path."),
+        ("Is gaming a good way to relieve stress?", "For many people, yes — it offers a real sense of escape."),
+        ("What was the first game you ever played?", "A classic platformer on an old console — I have fond memories."),
+        ("Do you prefer competitive or casual gaming?", "Casual mostly — I play to relax rather than to compete."),
+        ("What do you think of the latest update?", "Mixed feelings — some improvements, but a few things feel worse."),
+        ("Do you think games can be genuinely artistic?", "Absolutely — some tell stories in ways no other medium can."),
+        ("How do you avoid spending too much on in-game purchases?", "I set a monthly limit and treat it like any other entertainment budget."),
+        ("What genre do you spend most time in?", "RPGs mostly — I love the sense of progression and exploration."),
+        ("Is online gaming as fun as playing in person?", "Different, but it has its own appeal — especially with good friends."),
+        ("Do younger people have an advantage in competitive games?", "Reaction time helps, but game sense and experience count for a lot too."),
+    ],
+
+    # ── Internet ────────────────────────────────────────────────────
+    'internet': [
+        ("Did you see that video going around?", "Yes, I saw it last night — it was incredibly well-made."),
+        ("How do you avoid falling for misinformation online?", "Cross-check with multiple reliable sources before sharing anything."),
+        ("Do you follow many people online?", "I try to keep my feed focused on things that genuinely interest me."),
+        ("Have you tried podcasts instead of music for commuting?", "Yes — I have learned so much more since making the switch."),
+        ("How do you manage being reachable all the time?", "I set specific times when I check messages and stick to them."),
+        ("Is it better to send an email or a message?", "Email for anything formal; a message is fine for quick things."),
+        ("What do you do when someone misunderstands your message?", "I clarify calmly and try to understand what led to the confusion."),
+        ("How do you communicate clearly in writing?", "Be direct, keep sentences short, and always re-read before sending."),
+        ("Do you think social media is good or bad overall?", "Like most tools, it depends entirely on how you use it."),
+        ("How do you deal with negative comments online?", "I try not to engage — it rarely leads anywhere useful."),
+        ("Have you ever taken a break from social media?", "Yes — it was quieter, and honestly quite refreshing."),
+        ("What do you use for keeping notes and ideas?", "A simple notes app — the key is actually reviewing it regularly."),
+        ("Do you think people share too much online?", "Sometimes — a bit of friction before posting can be a good thing."),
+        ("How do you find new things to read or watch?", "Recommendations from people I trust are more reliable than algorithms."),
+        ("What is your approach to managing notifications?", "Most are turned off — I check on my terms, not the app's."),
+    ],
+
+    # ── Science and environment ─────────────────────────────────────
+    'science_and_environment': [
+        ("Why did the experiment not work?", "The temperature was not controlled carefully enough."),
+        ("How do we know the universe is expanding?", "We observe that distant galaxies are moving away from us."),
+        ("What is the simplest way to reduce my carbon footprint?", "Eat less meat, fly less, and choose public transport where possible."),
+        ("Why do seasons change?", "Because the Earth is tilted on its axis as it orbits the sun."),
+        ("Is nuclear energy safe?", "Modern reactors have strong safety records, but waste remains a challenge."),
+        ("What causes thunder?", "It is the rapid expansion of air heated by a lightning bolt."),
+        ("How long does plastic take to decompose?", "Most plastic takes hundreds of years, some over a thousand."),
+        ("Are electric vehicles actually better for the environment?", "Over their full lifecycle, yes — though manufacturing has a cost too."),
+        ("Why is biodiversity so important?", "It keeps ecosystems stable and resilient against disruptions."),
+        ("Can individuals really make a difference for the climate?", "Every action matters, and collective small changes add up significantly."),
+        ("What happens to recycled material?", "It is sorted, processed, and made into new products — the system is imperfect but improving."),
+        ("Is there a simple way to explain photosynthesis?", "Plants use sunlight to convert water and carbon dioxide into food and oxygen."),
+        ("How does a vaccine work?", "It teaches the immune system to recognise a pathogen without causing the disease itself."),
+        ("Why do we still have questions about dark matter?", "We know it exists from its gravitational effects, but have not yet directly detected it."),
+        ("What is the most immediate threat from climate change?", "Extreme weather events, sea level rise, and disruption to food and water systems."),
+    ],
+
+    # ── Emotions and wellbeing ──────────────────────────────────────
+    'emotions_and_wellbeing': [
+        ("How do you manage stress during busy periods?", "I try to take short breaks and focus on one thing at a time."),
+        ("What helps you feel better when you are upset?", "A walk outside usually helps me clear my head."),
+        ("How can we support a friend going through a tough time?", "Listen without judgement and let them lead the conversation."),
+        ("Is it okay to talk about mental health at work?", "Increasingly yes — workplaces are becoming more open about it."),
+        ("How do you know when you need to take a break?", "When small things start feeling overwhelming, that is usually the sign."),
+        ("What do you do when you cannot sleep?", "I try to avoid screens and read something calming instead."),
+        ("How do you stay motivated when things get hard?", "I remind myself of why I started and celebrate small progress."),
+        ("Do you have any daily habits that help your mood?", "Morning exercise and a consistent sleep routine make a big difference."),
+        ("How do you deal with criticism?", "I try to separate the message from the emotion and find what is useful."),
+        ("What is your approach to staying positive?", "I focus on what I can control and try to appreciate small wins."),
+        ("How do you handle situations where you have no control?", "I try to accept what I cannot change and focus energy on what I can."),
+        ("What do you find most draining emotionally?", "Situations where I feel unheard or where communication breaks down."),
+        ("How do you recover after a particularly hard week?", "Rest, time with people who energise me, and something completely unrelated to work."),
+        ("Do you have any rituals that help you reset?", "A long walk with no phone always does it."),
+        ("How do you help yourself through periods of low motivation?", "I reduce expectations temporarily and focus on just showing up."),
+    ],
+
+    # ── Communication ───────────────────────────────────────────────
+    'communication': [
+        ("How do you start a difficult conversation?", "I try to choose the right moment and lead with empathy."),
+        ("What do you do if someone is not listening?", "I pause and ask if now is a good time to talk."),
+        ("Is it better to be direct or diplomatic?", "Both have their place — context usually guides the right approach."),
+        ("How do you disagree respectfully?", "I acknowledge their point before explaining my own perspective."),
+        ("What makes someone a great communicator?", "Clarity, listening well, and adapting to the audience."),
+        ("How do you write a professional email quickly?", "Start with the key point, be concise, and always proofread."),
+        ("How do you prepare for a big presentation?", "Know your material well, practise out loud, and anticipate questions."),
+        ("What should you avoid in a job interview?", "Speaking negatively about former employers or being too vague."),
+        ("How do you give feedback to someone who is defensive?", "Focus on the behaviour and the impact rather than the person."),
+        ("What is the best way to ask for help?", "Be specific about what you need and make it easy for the other person to say yes."),
+        ("How do you handle being talked over in a meeting?", "I pause, wait for a gap, and re-enter calmly and clearly."),
+        ("What do you do when you have misread someone's tone?", "Acknowledge it and ask directly — most people appreciate the clarification."),
+        ("How do you keep a conversation going when it stalls?", "I ask an open question about something they mentioned earlier."),
+        ("Is silence in a conversation always a bad sign?", "Not at all — comfortable silence is a mark of genuine connection."),
+        ("How do you keep email communication concise?", "State the request in the first line and move everything else to bullet points."),
+    ],
+
+    # ── Finance ─────────────────────────────────────────────────────
+    'finance': [
+        ("Should I start investing now or wait?", "The best time to start is usually as soon as you have an emergency fund in place."),
+        ("What is the difference between a Stocks and Shares ISA and a Cash ISA?", "One holds investments; the other is essentially a tax-free savings account."),
+        ("How do I start budgeting if I never have before?", "Track every purchase for one month first — the patterns will reveal themselves."),
+        ("Is it worth paying off my mortgage early?", "Compare the mortgage rate to what your savings could earn — the maths guides the answer."),
+        ("How much should I have in an emergency fund?", "Three to six months of essential outgoings is the standard recommendation."),
+        ("What is dollar-cost averaging?", "It means investing a fixed amount at regular intervals regardless of market conditions."),
+        ("Are index funds a good option for beginners?", "Many experts recommend them for their low costs and broad diversification."),
+        ("How does inflation affect my savings?", "If your savings earn less than inflation, the purchasing power of your money falls."),
+        ("What is the difference between a debit and a credit card?", "A debit card uses your own money; a credit card borrows money you repay later."),
+        ("Should I pay off debt before saving?", "High-interest debt should usually be cleared first — then build your savings."),
+    ],
+
+    # ── Sport ───────────────────────────────────────────────────────
+    'sport': [
+        ("How do athletes stay motivated during a long season?", "Clear goals, a supportive team environment, and good recovery habits all help."),
+        ("What is the best way to avoid injury when starting to train?", "Build gradually, prioritise recovery, and listen to your body carefully."),
+        ("How important is nutrition for performance?", "Critically important — what you eat directly affects your energy and recovery."),
+        ("What makes a good coach?", "Technical knowledge, emotional intelligence, and the ability to get the best from each individual."),
+        ("Is mental strength more important than physical ability at the elite level?", "At the top, the physical differences are small — mindset often decides."),
+        ("How do you deal with a losing streak?", "Analyse without overreacting, keep training well, and trust the process."),
+        ("What is periodisation in training?", "It is a structured approach to varying training load to peak at the right time."),
+        ("How does sports psychology help athletes?", "It builds mental skills like focus, resilience, and composure under pressure."),
+        ("What separates good athletes from great ones?", "Consistency, attention to detail, and the willingness to keep improving."),
+        ("How do team sports develop life skills?", "Communication, accountability, dealing with setbacks, and working towards shared goals."),
+    ],
+
+    # ── Music ───────────────────────────────────────────────────────
+    'music': [
+        ("How do you choose what to listen to?", "Mood drives most of it — I have playlists for almost every state of mind."),
+        ("Is music theory necessary to play an instrument?", "Not essential to start, but it becomes very useful as you progress."),
+        ("How do you get over stage fright?", "Preparation is the best cure — the more you know the material, the calmer you feel."),
+        ("What is the best way to practise when you are short on time?", "Focus on the difficult passages rather than playing things you already know."),
+        ("How has streaming changed the music industry?", "It democratised access but significantly reduced per-stream revenue for artists."),
+        ("Do lyrics matter as much as the music itself?", "They can carry completely different weight depending on the listener."),
+        ("What makes a great live performance?", "Connection with the audience — technical perfection matters less than presence."),
+        ("How do you find new music you enjoy?", "Following recommendations from people with similar taste works better than algorithms."),
+        ("Is classical music harder to learn than popular music?", "The notation and technique demand more formal training, but both have their challenges."),
+        ("What role does music play in cultural identity?", "It carries history, shared memory, and a sense of belonging that little else can replicate."),
+    ],
+
+    # ── Architecture ────────────────────────────────────────────────
+    'architecture': [
+        ("What makes a building feel welcoming?", "Scale, natural light, and the way it meets the ground all play a role."),
+        ("How do architects account for how a building will age?", "Through material choices, maintenance planning, and designing for flexibility of use."),
+        ("Is sustainable architecture more expensive?", "Often upfront, but the whole-life costs are usually lower."),
+        ("What is the difference between a structural and an interior designer?", "One deals with how a building stands up; the other with how it feels inside."),
+        ("How does planning permission work?", "You submit designs to the local authority who assess them against planning policy."),
+        ("What is passive design?", "It uses orientation, insulation, and ventilation to regulate temperature without mechanical systems."),
+        ("How do you renovate a listed building?", "Carefully — changes require consent and must respect the character of the building."),
+        ("What is the most challenging part of designing a public building?", "Meeting the needs of many different users while keeping the space coherent."),
+        ("How does architecture influence behaviour?", "Space affects how people move, interact, and feel — good design does this intentionally."),
+        ("What is brutalism?", "An architectural movement using exposed concrete and bold geometric forms, prominent from the 1950s."),
+    ],
+
+    # ── Law ─────────────────────────────────────────────────────────
+    'law': [
+        ("What is the difference between a solicitor and a barrister?", "Solicitors advise clients; barristers typically argue cases in higher courts."),
+        ("How does small claims court work?", "It handles lower-value disputes with simplified procedures and no need for a lawyer."),
+        ("What is legal aid?", "State-funded legal support for those who cannot afford private representation."),
+        ("Can a verbal agreement be legally binding?", "Yes, though proving the terms can be difficult without written evidence."),
+        ("What does without prejudice mean?", "It means a communication cannot be used as evidence in court proceedings."),
+        ("How long does it take to get a court date?", "It varies widely — from weeks to over a year depending on the court and case type."),
+        ("What is the burden of proof in a civil case?", "The claimant must show their case is more likely than not — the balance of probabilities."),
+        ("What happens if I miss a court date?", "The court may proceed without you, which often leads to a judgment against you."),
+        ("Is a contract valid without a witness?", "In most cases yes, but certain contracts — like wills — require witnessed signatures."),
+        ("What is the difference between a fine and a penalty?", "In most contexts they are interchangeable, though a fine is usually a fixed financial sum."),
+    ],
+
+    # ── History ─────────────────────────────────────────────────────
+    'history': [
+        ("How do we know what ancient civilisations were like?", "Through archaeology, written records, and material culture where it survives."),
+        ("Was history always written by the victors?", "Often, yes — which is why historians now work hard to recover silenced perspectives."),
+        ("What was daily life like in medieval Europe?", "Demanding and short by modern standards, but communities had rich social and cultural lives."),
+        ("How significant was the printing press?", "Transformative — it enabled the rapid spread of ideas and is linked to the Reformation."),
+        ("Why do we study history?", "To understand how we got here, avoid repeating mistakes, and appreciate the present."),
+        ("Was the Roman Empire really in decline for centuries?", "Historians debate the timeline, but yes, it was a gradual process with many causes."),
+        ("How do oral histories compare to written records?", "They capture experiences the written record misses, but require careful interpretation."),
+        ("What caused the collapse of ancient civilisations?", "Usually a combination of climate, resource stress, internal conflict, and external pressures."),
+        ("How reliable are ancient historical accounts?", "Patchy — bias, exaggeration, and gaps are common, so cross-referencing is essential."),
+        ("Is there such a thing as an objective history?", "Historians aim for it, but every account involves choices about what to include and how."),
+    ],
+
+    # ── Arts ────────────────────────────────────────────────────────
+    'arts': [
+        ("What makes art meaningful?", "When it creates a genuine connection between the work and the person experiencing it."),
+        ("Should art always have a message?", "Not necessarily — some of the most powerful work resists straightforward interpretation."),
+        ("How do you respond to art you do not understand?", "Sit with the discomfort — understanding often comes later, or the response itself is enough."),
+        ("Is art subjective?", "Partly, but shared aesthetic and cultural frameworks mean some responses are more widely held."),
+        ("How has art changed since the internet?", "Distribution has democratised, but so has the noise — discoverability remains a challenge."),
+        ("What is the difference between fine art and commercial art?", "Fine art is made primarily for its own sake; commercial art serves a specific client purpose."),
+        ("How do artists price their work?", "Time, materials, market position, and reputation all factor in — it is rarely straightforward."),
+        ("What is the role of the arts in education?", "Creativity, critical thinking, and emotional intelligence are all developed through arts engagement."),
+        ("Is public funding for the arts justified?", "The economic, social, and cultural returns are well-documented — the case is strong."),
+        ("How do you know when a piece of work is finished?", "Often when removing anything more would take something away — though the line is subjective."),
+    ],
+
+    # ── Mental health ───────────────────────────────────────────────
+    'mental_health': [
+        ("What should I do if I think a friend is struggling?", "Check in gently, listen without rushing to fix things, and ask what they need."),
+        ("Is therapy effective?", "For most people and most conditions, yes — particularly evidence-based approaches like CBT."),
+        ("How do I know if I need professional help?", "If your distress is persistent, affecting daily life, or feels unmanageable alone."),
+        ("What is the difference between feeling sad and being depressed?", "Depression is more persistent, pervasive, and typically interferes significantly with daily function."),
+        ("Can exercise really help with anxiety?", "Yes — regular physical activity is one of the most evidence-supported interventions available."),
+        ("How do I find a therapist I can trust?", "Look for someone qualified, registered, and with experience in what you are dealing with."),
+        ("What is mindfulness actually about?", "Paying deliberate, non-judgmental attention to the present moment."),
+        ("Is it possible to have too much self-awareness?", "Rumination can tip into unhealthy territory — the aim is reflection, not self-criticism."),
+        ("How do you build resilience?", "Through experience of overcoming difficulty, good relationships, and a sense of meaning."),
+        ("What is the link between sleep and mental health?", "Bidirectional and strong — poor sleep worsens most conditions, and distress disrupts sleep."),
+    ],
+
+    # ── Transport ───────────────────────────────────────────────────
+    'transport': [
+        ("Is cycling safe in cities?", "It is improving with better infrastructure, but conditions vary significantly by city."),
+        ("What is the environmental impact of flying?", "Significant — aviation accounts for a notable share of transport-related emissions."),
+        ("How does congestion charging work?", "Drivers pay a fee to enter a defined zone, which reduces traffic and funds alternatives."),
+        ("What are the benefits of public transport over driving?", "Lower emissions, reduced road congestion, and often cheaper at scale."),
+        ("How long do electric vehicle batteries last?", "Most are designed to retain around eighty percent capacity after a decade of use."),
+        ("What is the future of self-driving vehicles?", "Progress is real but regulatory and safety challenges mean full autonomy is still some way off."),
+        ("Why is rail travel often more expensive than flying?", "Infrastructure costs and pricing structures — though the full environmental cost of flying is underpriced."),
+        ("How do cities reduce car dependency?", "Through investment in public transport, cycling, walking, and mixed-use development."),
+        ("What makes a transport network equitable?", "Affordability, reliability, and coverage that serves everyone, not just dense urban areas."),
+        ("Is high-speed rail worth the investment?", "The evidence from countries with it suggests yes — if demand and network design are right."),
+    ],
+
+    # ── Education policy ────────────────────────────────────────────
+    'education_policy': [
+        ("Should university be free?", "The evidence on the effects of fees is complex — both access and quality are affected."),
+        ("Are standardised tests a fair way to assess pupils?", "They measure some things well but miss much of what matters in a good education."),
+        ("How should schools handle smartphone use?", "Clear policies, consistently enforced, with genuine discussion about why they exist."),
+        ("What makes a great teacher?", "Deep subject knowledge, genuine care for pupils, and the ability to adapt."),
+        ("How do we close the attainment gap?", "Early years investment, teacher quality, and removing barriers to learning outside school."),
+        ("Is homework beneficial?", "For older pupils, well-designed homework helps — for younger children, the evidence is weaker."),
+        ("Should arts subjects receive equal funding to STEM?", "A rounded education needs both — and the evidence for arts' benefits is strong."),
+        ("How do we attract and retain great teachers?", "Pay, workload, autonomy, and genuine professional development all matter."),
+        ("What is the purpose of education?", "A contested question — but most would include knowledge, capability, and citizenship."),
+        ("Do smaller class sizes improve outcomes?", "The evidence is positive but modest — teacher quality matters more."),
+
+    ],
+
+    # ── Greetings & introductions ───────────────────────────────────
+    'greetings_introductions': [
+        ("Good morning! How are you?", "Good morning! I am very well, thank you. And you?"),
+        ("Hi! How is your day going?", "Pretty good so far, thanks! How about yours?"),
+        ("Hey, long time no see! How have you been?", "I know — it has been ages! I have been really well, thanks."),
+        ("Nice to meet you! I am Tom.", "Nice to meet you too, Tom. My name is Lisa."),
+        ("Is this your first time here?", "Yes, it is! I only arrived yesterday."),
+        ("Are you visiting or do you live here?", "I am just visiting for the week — I am from Canada originally."),
+        ("Do you speak English?", "Yes, a little. Please be patient with me!"),
+        ("How long have you been learning the language?", "About six months now. It is slow progress but I am enjoying it."),
+        ("What brings you here?", "I am here for a conference — and a bit of sightseeing afterwards."),
+        ("Welcome! Can I get you anything?", "Thank you so much! A glass of water would be lovely."),
+        ("Good evening! Welcome to our home.", "Thank you! What a beautiful place you have."),
+        ("I do not think we have met — I am James from the Manchester office.", "Of course! I am Anna — I have heard great things about you."),
+
+    ],
+
+    # ── Farewells ───────────────────────────────────────────────────
+    'farewells': [
+        ("It was so nice to meet you!", "Likewise! I really hope we run into each other again."),
+        ("I had a wonderful evening — thank you so much.", "It was our pleasure — you are welcome any time!"),
+        ("Safe travels! Let me know when you land.", "I will! Take care of yourself."),
+        ("See you next week!", "Looking forward to it. Take care!"),
+        ("Goodbye — it has been a real pleasure.", "The pleasure was all mine. Until next time!"),
+        ("I will miss you! Keep in touch.", "I will! You too — don't be a stranger."),
+        ("Thanks for everything. I cannot tell you how much it meant.", "It was nothing — that is what friends are for."),
+
+    ],
+
+    # ── Small talk ──────────────────────────────────────────────────
+    'small_talk': [
+        ("Can you believe this weather?", "I know! I did not expect it to turn out so warm today."),
+        ("Did you have a good weekend?", "It was lovely, thanks — we went to the coast. How about you?"),
+        ("Any exciting plans this week?", "Not really — a quiet one, I think. I need the rest!"),
+        ("Have you tried that new place on the high street?", "Not yet, but I keep meaning to. Is it good?"),
+        ("How are you finding the new office?", "It is great! Much easier to get to than the old one."),
+        ("Are you a morning person or an evening person?", "Definitely a morning person — I am useless after nine!"),
+        ("The traffic was a nightmare this morning, wasn't it?", "It really was — I ended up being twenty minutes late."),
+        ("I feel like this week has just flown by.", "I know! I cannot believe it is already Friday."),
+        ("Have you heard about the new development on the old factory site?", "Yes — mixed feelings about it, honestly."),
+        ("What did you get up to over the bank holiday?", "We had a barbecue on Sunday — it was really lovely."),
+        ("Are you watching anything good at the moment?", "Yes! I started a new series last week — I am already hooked."),
+        ("How are the kids?", "Growing too fast! They are both at school now, which is hard to believe."),
+        ("I have not slept well all week — I am exhausted.", "I am sorry to hear that. Have you tried cutting out caffeine in the afternoon?"),
+        ("Is it just me, or is everyone in a rush today?", "I noticed that too. Must be something in the air!"),
+        ("Do you have any plans for the summer?", "We are thinking of going to Portugal — fingers crossed!"),
+
+    ],
+
+    # ── Asking directions ───────────────────────────────────────────
+    'asking_directions': [
+        ("Excuse me, is the train station far?", "Not at all — it is about a ten-minute walk straight ahead."),
+        ("Which way is the town centre, please?", "Turn left at the lights and follow the road for about five minutes."),
+        ("Is there a pharmacy nearby?", "Yes, there is one just around the corner on the right."),
+        ("Excuse me, does this bus go to the high street?", "Yes, it does — you want to get off at the third stop."),
+        ("I am looking for the post office — any idea?", "It is on the main road, just past the bank on your left."),
+        ("How do I get to the museum from here?", "Take the second left, then it is straight on for about five minutes. You cannot miss it."),
+        ("Is the beach walkable from here?", "It is about twenty minutes on foot — just head towards the seafront."),
+        ("Am I going the right way for the old town?", "Yes, you are on the right track — keep going for another ten minutes."),
+        ("Could you show me on the map?", "Of course! We are here, and you want to get to here."),
+        ("Is there a taxi rank at the station?", "Yes, there is one right outside the main exit."),
+        ("How many stops to the city centre on the metro?", "Just three — it is very quick."),
+        ("I think I am on the wrong bus.", "Where are you trying to get to? I can tell you which one to take."),
+
+    ],
+
+    # ── Making requests ─────────────────────────────────────────────
+    'making_requests': [
+        ("Could you hold the lift, please?", "Of course — jump in!"),
+        ("Can I borrow a pen for a moment?", "Sure, here you go. No rush to return it."),
+        ("Would you mind taking a photo of us?", "Not at all! Shall I take a few so you can choose?"),
+        ("Could you speak more slowly, please?", "Of course, I am sorry! Is this better?"),
+        ("Do you mind if I sit here?", "Go ahead — the seat is free."),
+        ("Could you help me carry this?", "Happy to! Where are we taking it?"),
+        ("Is it okay to open the window?", "Please do — it is quite warm in here."),
+        ("Can I have the wifi password, please?", "Of course! It is on the card next to the kettle."),
+        ("Could you give me a hand with this form?", "Of course — let us go through it together."),
+        ("Would it be possible to get a bit more time?", "I think we can manage that — how much do you need?"),
+        ("Can I leave my bag here for a moment?", "Of course — I will keep an eye on it."),
+        ("Could you check if I have filled this in correctly?", "Sure, let me take a look."),
+
+    ],
+
+    # ── Apologies & gratitude ───────────────────────────────────────
+    'apologies_gratitude': [
+        ("I am so sorry — that was my fault completely.", "Please do not worry about it — these things happen."),
+        ("I apologise for the delay.", "That is quite all right — thank you for letting me know."),
+        ("Sorry to keep you waiting!", "No problem at all — I just arrived myself."),
+        ("I really am sorry for the misunderstanding.", "Honestly, it is fine — no harm done."),
+        ("I owe you a big apology.", "Let us not dwell on it — all is forgiven."),
+        ("Thank you so much — you really saved me!", "It was nothing — I am glad I could help."),
+        ("I cannot thank you enough for everything.", "It was my pleasure, truly."),
+        ("That was so kind of you.", "Not at all! Happy to help any time."),
+        ("Thank you for being so patient with me.", "Of course — take all the time you need."),
+        ("You have been incredibly helpful — I really appreciate it.", "It was a pleasure. I hope everything works out well."),
+
+    ],
+
+    # ── Phone calls ─────────────────────────────────────────────────
+    'phone_calls': [
+        ("Hello? Is this a good time to talk?", "Yes, perfect timing! What is on your mind?"),
+        ("Sorry, I missed your call — what did you need?", "No worries! I just wanted to check if we were still on for tomorrow."),
+        ("I think we got cut off — can you hear me now?", "Yes! That is much better. You were breaking up a bit."),
+        ("Could you speak up a little? The line is bad.", "Is that better? I will move somewhere with a stronger signal."),
+        ("Could I leave a message for her, please?", "Of course — I will make sure she gets it as soon as she is back."),
+        ("I am calling to confirm my appointment for tomorrow.", "Let me just check for you. Yes, we have you in at ten thirty."),
+        ("Could you hold on for just a moment?", "Of course — take your time."),
+        ("I am returning your call from earlier.", "Thank you for getting back to me! I wanted to ask about the booking."),
+        ("Sorry, I did not catch the number — could you repeat it?", "Of course — it is oh eight hundred, four five six, seven eight nine."),
+        ("Is there a direct number I can use next time?", "Yes — let me give you my direct line."),
+        ("Sorry, is this the dentist?", "No, I think you have the wrong number, sorry!"),
+        ("Could someone call me back when it is convenient?", "Absolutely — what number should we use?"),
+
+    ],
+
+    # ── Restaurant & café ───────────────────────────────────────────
+    'restaurant_cafe': [
+        ("Do you have a table for two available?", "Yes, we do — would you prefer inside or outside?"),
+        ("What do you recommend today?", "The grilled fish is very popular — it comes with a lovely salad."),
+        ("Is this dish vegetarian?", "Yes, it is completely meat-free."),
+        ("Does this contain any nuts?", "Let me check with the kitchen for you — I want to be sure."),
+        ("Could we have a few more minutes to decide?", "Of course — take your time. I will come back shortly."),
+        ("I am afraid this is not what I ordered.", "I am very sorry about that — let me sort that out for you right away."),
+        ("Could I swap the potatoes for extra vegetables?", "Absolutely — no problem at all."),
+        ("This is absolutely delicious!", "I am so glad you are enjoying it. I will pass that on to the chef."),
+        ("Could we have the bill when you get a chance?", "Of course — shall I split it or keep it together?"),
+        ("Is service included?", "It is not included — but it is entirely up to you."),
+        ("Do you do oat milk?", "We do — would you like that in your coffee?"),
+        ("Could I have this to take away instead?", "Of course — I will box it up for you."),
+        ("We have a reservation for eight o'clock.", "Welcome! Could I take your name?"),
+        ("The soup is a little cold, I am afraid.", "I am so sorry — let me take that back and get you a fresh one."),
+        ("Could I see the dessert menu, please?", "Of course! Here you are — everything is made fresh on site."),
+
+    ],
+
+    # ── Expressing feelings ─────────────────────────────────────────
+    'expressing_feelings': [
+        ("Are you okay? You seem a bit down today.", "I am just a little tired — thank you for asking."),
+        ("You look worried — is everything all right?", "I have just got a lot on my mind. I will be fine."),
+        ("I am so nervous about tomorrow.", "That is completely understandable. You have prepared well — trust yourself."),
+        ("I honestly do not know how to thank you.", "Seeing you happy is enough, honestly."),
+        ("I feel terrible about what happened.", "I understand. The important thing is that you are aware of it now."),
+        ("I am absolutely over the moon!", "That is brilliant news — you deserve it!"),
+        ("I am feeling a bit lost at the moment.", "That is okay — it happens to everyone. Do you want to talk it through?"),
+        ("I cannot stop smiling today.", "That is wonderful to hear — what has happened?"),
+        ("I find this really hard to say, but I am not happy.", "I am really glad you told me. Let us talk about what we can do."),
+        ("I feel so much better now — thank you.", "I am really glad to hear that."),
+
+    ],
+
+    # ── Compliments ─────────────────────────────────────────────────
+    'compliments': [
+        ("You have done such an amazing job with this.", "That is so kind of you to say — it took a while!"),
+        ("I love your jacket — where did you get it?", "Thank you! I found it in a little shop on my holiday."),
+        ("Your English is so good!", "Thank you — I have been practising for a few years now."),
+        ("You have a wonderful sense of humour.", "You are too kind! You are pretty funny yourself."),
+        ("This food is incredible.", "Thank you so much — it is my grandmother's recipe."),
+        ("You explained that so clearly — I finally understand!", "I am really glad it made sense. Please ask if anything is still unclear."),
+        ("You look really well!", "Thank you! I have been trying to get more sleep — it makes such a difference."),
+        ("That was a brilliant presentation.", "Thank you — I was terrified, but it seemed to go all right."),
+
+    ],
+
+    # ── Making plans ────────────────────────────────────────────────
+    'making_plans': [
+        ("Are you free on Saturday?", "I think so — what did you have in mind?"),
+        ("Shall we meet at seven?", "Seven is perfect for me. Where were you thinking?"),
+        ("We should definitely do this again.", "Absolutely — same time next month?"),
+        ("Fancy going for a coffee sometime this week?", "I would love that — how about Thursday afternoon?"),
+        ("Are you coming to the party on Friday?", "I would not miss it! Can I bring anything?"),
+        ("What time works best for you?", "Afternoon is better for me — does three o'clock suit you?"),
+        ("I will send you a calendar invite.", "Perfect — I have already blocked the time out."),
+        ("Shall we say the café by the park?", "Good shout — I will book a table just in case."),
+        ("Are you bringing anyone?", "Just me — I hope that is okay!"),
+        ("Let me know if plans change.", "Of course — and same from my end."),
+
+    ],
+
+    # ── Shopping ────────────────────────────────────────────────────
+    'shopping_daily': [
+        ("Do you have this in a size medium?", "Let me check in the stockroom — I will be right back."),
+        ("How much is this?", "That one is twenty-four ninety-nine."),
+        ("Is there anything on sale at the moment?", "Yes — everything on this rail is thirty percent off."),
+        ("Can I try this on?", "Of course — the changing rooms are at the back."),
+        ("I would like to return this — I have the receipt.", "No problem at all — would you like an exchange or a refund?"),
+        ("Do you gift wrap?", "We do — it is a small charge but it looks really lovely."),
+        ("Is this the last one you have?", "Let me check — I may have another in the back."),
+        ("Can I pay contactless?", "Of course — just tap when you are ready."),
+
+    ],
+
+    # ── Accommodation ───────────────────────────────────────────────
+    'accommodation': [
+        ("I have a booking under the name Wilson.", "Let me find that for you. Ah yes — a double room for three nights."),
+        ("Is breakfast included?", "Yes, it is served in the dining room from seven until ten."),
+        ("Could I have a room with a view if possible?", "I will see what we have available — I will do my best."),
+        ("What time is checkout?", "Checkout is by eleven, but we are happy to store your luggage after that."),
+        ("The shower does not seem to be working.", "I am sorry about that — I will send someone up straight away."),
+        ("Could I have an extra blanket please?", "Of course — I will bring one up right away."),
+        ("Is there parking here?", "Yes, we have a car park around the back — it is complimentary for guests."),
+        ("Can I extend my stay by one more night?", "Let me check availability — I do not think we have any problem with that."),
+
+    ],
+
+    # ── Transport ───────────────────────────────────────────────────
+    'transport_daily': [
+        ("Which platform for the London train?", "Platform four — it departs in about eight minutes."),
+        ("One return to Birmingham, please.", "That is forty-two pounds. Would you like first class?"),
+        ("Does this bus go to the university?", "Yes — you need to get off at the main gate, about six stops from here."),
+        ("Is there a direct train or do I have to change?", "There is a direct one at eleven fifteen, or you can change at Bristol."),
+        ("Could you let me know when we reach the town hall stop?", "Of course — it is about five minutes away."),
+        ("I missed my connection — what are my options?", "The next one leaves in forty minutes — let me check if your ticket is valid on it."),
+        ("Is there a taxi rank at the station?", "Yes, just outside the main exit — there is usually a short wait."),
+        ("How much is the fare to the airport roughly?", "About thirty-five pounds depending on traffic."),
+
+    ],
+
+    # ── Emergencies ─────────────────────────────────────────────────
+    'emergencies': [
+        ("Please help — I cannot find my child.", "Stay calm — let us go to the information desk right now."),
+        ("I do not feel well at all.", "Let us find somewhere to sit down — I will get you some water."),
+        ("My bag has been stolen.", "I am so sorry — we need to call the police. Do you have your passport?"),
+        ("I have locked myself out of my room.", "Do not worry — come to reception and we will sort a new key card."),
+        ("I think I need a doctor.", "There is a medical centre nearby — I can take you there or call someone."),
+        ("I have lost my passport.", "That is very stressful — the first step is to contact your embassy."),
+        ("I have missed my flight.", "Let us go to the airline desk together — they may be able to help rebook."),
+    ],
+}
+
+DIALOGUE_SECTIONS.update(EXTRA_DIALOGUE)
+
+# Flat view kept for backwards compatibility with existing strategies.
 DIALOGUE_PAIRS: list[tuple[str, str]] = [
-    # ── Classroom ────────────────────────────────────────────────────────
-    ("Could you explain that again, please?", "Of course, let me try a different approach."),
-    ("What page are we on?", "We are on page forty-two, near the bottom."),
-    ("Is this going to be graded?", "Yes, it counts towards your final mark."),
-    ("Can I work with a partner on this?", "Absolutely, just make sure you both contribute equally."),
-    ("Do we need to show our working?", "Yes, showing your steps is part of the assessment."),
-    ("Can I hand it in tomorrow instead?", "I can give you one extra day, but no later than that."),
-    ("I do not understand the question.", "Let me rephrase it in a simpler way for you."),
-    ("Is there a word limit for this essay?", "Aim for between five hundred and eight hundred words."),
-    ("Will this topic come up in the exam?", "It is worth knowing, so I would definitely revise it."),
-    ("Can I borrow your notes?", "Sure, but make sure you return them before Friday."),
-    ("When is the next assignment due?", "You have until the end of next week."),
-    ("Is it okay to use online sources?", "Yes, as long as you cite them properly."),
-    ("Can we discuss this in groups?", "That is a great idea — give yourselves ten minutes."),
-    ("What does this term mean?", "It refers to the process of breaking something down into its parts."),
-    ("Should I include an introduction?", "Yes, always start with a clear introduction."),
-    ("How many references do we need?", "At least five, and they should be from academic sources."),
-    ("Is it better to use first person or third person?", "Third person is more formal and usually preferred for academic writing."),
-    ("Can you check my draft before I submit it?", "Leave it with me and I will have a look by tomorrow."),
-    ("What happens if I miss the deadline?", "There is a late penalty, so it is better to submit something than nothing."),
-    ("Should we write a conclusion?", "Yes, and it should do more than simply repeat what you have already said."),
-    # ── Workplace ─────────────────────────────────────────────────────────
-    ("Have you finished the report?", "Almost — I just need to check the final figures."),
-    ("Do you think we should try a different method?", "That is a good idea — let us discuss it as a team."),
-    ("Can you help me understand this diagram?", "Sure, let me walk you through it step by step."),
-    ("Is the meeting still on for tomorrow?", "Yes, same time and same room."),
-    ("Do you prefer working in a team or alone?", "It depends on the task, but I enjoy both."),
-    ("Could you clarify the deadline for this?", "It needs to be done by close of business on Friday."),
-    ("Should I copy the manager on this email?", "Yes, it is good to keep them in the loop."),
-    ("How do we handle this client complaint?", "We acknowledge it quickly and offer a clear resolution."),
-    ("Can you take notes during the meeting?", "No problem, I will send the summary by end of day."),
-    ("I think there is a mistake in the report.", "Let me have a look — can you point out the section?"),
-    ("Is the deadline flexible?", "Not really — the client is expecting it on Thursday."),
-    ("Who is leading the project now?", "It has been reassigned to the senior team."),
-    ("Can we get an update on the budget?", "I will pull the figures and share them before noon."),
-    ("Should we loop in the design team?", "Good point — I will send them a message right away."),
-    ("What is our top priority this week?", "Finishing the client presentation takes precedence."),
-    ("Should we set up a weekly check-in?", "That sounds useful — I will send a recurring invite."),
-    ("Who should sign off on this?", "It needs to go through the head of department first."),
-    ("Can we move the standup to a different time?", "What time works better for you — I can adjust it."),
-    ("How do we handle scope creep on this project?", "We document every change request and get written approval before proceeding."),
-    ("What is the best way to escalate this?", "Email the line manager with a clear summary and proposed next steps."),
-    # ── Technology ────────────────────────────────────────────────────────
-    ("Why is my internet so slow today?", "It might be worth restarting your router."),
-    ("How do I recover a deleted file?", "Check the recycle bin first — it may still be there."),
-    ("What is the difference between saving and exporting?", "Saving keeps it in the original format; exporting converts it."),
-    ("Is it safe to click on this link?", "If you do not recognise the sender, I would avoid it."),
-    ("My laptop keeps overheating — what should I do?", "Make sure the vents are clear and try a cooling pad."),
-    ("How do I set up two-factor authentication?", "Go to your account settings and look for the security section."),
-    ("Should I update the software now or later?", "It is best to update soon — patches often fix security issues."),
-    ("Can I share my screen with the team?", "Yes, just click the share button at the bottom of the window."),
-    ("Why does the app keep crashing?", "Try clearing the cache or reinstalling the latest version."),
-    ("Is cloud storage actually secure?", "It depends on the provider, but reputable services use strong encryption."),
-    ("How do I free up space on my phone?", "Delete unused apps and move photos to cloud storage."),
-    ("What is a VPN and do I need one?", "It encrypts your connection — useful on public networks."),
-    ("How do I stop getting so many spam emails?", "Use your email filter and unsubscribe from unwanted lists."),
-    ("Can I use this laptop offline?", "Yes, most applications will work without an internet connection."),
-    ("What is the difference between a virus and malware?", "Malware is the broader category — a virus is one specific type."),
-    ("How do I back up my files automatically?", "Set up cloud sync or schedule a regular backup with your operating system."),
-    ("Why did my computer slow down after the update?", "Sometimes updates require a restart to complete — try rebooting first."),
-    ("What is the safest browser to use?", "Most modern browsers are comparable — keeping it updated matters more."),
-    ("How do I share a large file with someone?", "Use a cloud service like a shared folder link rather than email attachment."),
-    ("Should I use the same password for everything?", "No — use a password manager and a unique password for each account."),
-    # ── Healthcare ────────────────────────────────────────────────────────
-    ("Are you feeling better today?", "A little, thank you — the rest really helped."),
-    ("Did you take your medicine this morning?", "Yes, I took it right after breakfast."),
-    ("Should I go to the doctor or wait and see?", "If it has lasted more than three days, I would get it checked."),
-    ("Is it safe to exercise when you are sick?", "Light walking is usually fine, but avoid anything intense."),
-    ("How long do I need to fast before the blood test?", "Typically eight to twelve hours — water is fine to drink."),
-    ("Can I take both of these tablets at the same time?", "Check with your pharmacist to be sure there are no interactions."),
-    ("What should I eat when I have an upset stomach?", "Plain food like rice, toast, and bananas is usually gentle."),
-    ("How do I know if I am dehydrated?", "Dark urine, dry mouth, and feeling dizzy are common signs."),
-    ("Is it normal to feel tired after starting this medication?", "Yes, fatigue can be a short-term side effect — it usually passes."),
-    ("When should I see a specialist instead of my GP?", "Your GP will refer you if they think specialist care is needed."),
-    ("How long will the recovery take?", "It varies, but most people feel better within a week or two."),
-    ("Should I avoid any foods while taking this?", "Yes, check the leaflet — some medications interact with certain foods."),
-    ("Can I drive while taking this medication?", "Check whether drowsiness is listed as a side effect — if so, avoid driving."),
-    ("Is this dosage right for my age?", "Your GP will have calculated it based on your specific details."),
-    ("How do I know if the treatment is working?", "Your symptoms should gradually improve — go back if they worsen."),
-    ("Should I rest completely or stay gently active?", "Gentle movement is usually better than complete bed rest for most conditions."),
-    ("Can stress make physical symptoms worse?", "Yes, stress has well-documented effects on the immune and digestive systems."),
-    ("Is it okay to stop the antibiotics early if I feel better?", "No — always complete the full course to avoid antibiotic resistance."),
-    ("What is the difference between a cold and the flu?", "Flu typically has a sudden onset and includes fever, body aches, and fatigue."),
-    ("How much water should I be drinking each day?", "Around two litres is a general guide, though individual needs vary."),
-    # ── Travel ────────────────────────────────────────────────────────────
-    ("What is the best time of year to visit?", "Spring and autumn are usually the most pleasant seasons there."),
-    ("How long is the flight?", "It is about eleven hours with one connection."),
-    ("Do I need to book tours in advance?", "For popular attractions, definitely — they sell out quickly."),
-    ("What currency do they use there?", "They use the local currency, so exchange some before you leave."),
-    ("Is the tap water safe to drink?", "In most major cities, yes — but check for the specific region."),
-    ("How do I get from the airport to the city centre?", "There is a direct train that runs every twenty minutes."),
-    ("Should I get travel insurance?", "Always — it is worth it for peace of mind."),
-    ("What is the local food like?", "It is absolutely delicious and very affordable."),
-    ("Is it easy to get around without speaking the language?", "In tourist areas, many people speak English — apps help too."),
-    ("How many days would you recommend for this city?", "Three to four days gives you a good feel for it."),
-    ("Can I use my phone there without extra charges?", "Check with your network provider about international roaming."),
-    ("Is it safe to travel there at the moment?", "It is worth checking the latest travel advisory before you go."),
-    ("What should I do if I lose my passport?", "Contact your embassy or consulate immediately — they can help quickly."),
-    ("How do I avoid tourist traps?", "Walk a few streets away from the main squares and eat where locals do."),
-    ("Is it worth hiring a car?", "Only if you plan to travel outside the city — public transport is fine for most."),
-    ("What are the visa requirements?", "It depends on your nationality — check the official government website."),
-    ("Should I tip in restaurants?", "Tipping customs vary — in some countries it is expected, in others unusual."),
-    ("How do I stay safe when travelling alone?", "Share your itinerary with someone at home and keep valuables out of sight."),
-    ("What is the best way to deal with jet lag?", "Stay awake until local bedtime and get outside in natural light."),
-    ("Are there any cultural customs I should know about?", "Dressing modestly and removing shoes in certain spaces are common requirements."),
-    # ── Food ──────────────────────────────────────────────────────────────
-    ("What is the recipe for this?", "It is actually quite simple — I will write it down for you."),
-    ("How do you know when the pasta is ready?", "Taste it — it should be soft but still have a slight bite."),
-    ("Can I substitute something for the cream?", "Coconut milk works really well as an alternative."),
-    ("Why did my cake come out flat?", "The baking powder might have been expired or the oven too cool."),
-    ("How spicy is this dish?", "It has a gentle warmth, but nothing too intense."),
-    ("Should I let the meat rest before cutting it?", "Yes, a few minutes of resting keeps the juices in."),
-    ("What herbs go well with chicken?", "Rosemary, thyme, and tarragon are all excellent choices."),
-    ("How long does this keep in the fridge?", "Up to three days if stored in an airtight container."),
-    ("Is this dish vegetarian?", "Yes, it contains no meat or fish."),
-    ("What wine would pair well with this?", "A light white would complement the flavours nicely."),
-    ("How do I stop onions from making me cry?", "Try chilling them first or cutting near running water."),
-    ("Is it better to use butter or oil for this?", "Butter adds richness; oil works better at higher temperatures."),
-    ("Can I freeze this after cooking?", "Yes, let it cool completely first and freeze within two hours."),
-    ("How do I get the bread to form a crust?", "Place a tray of water in the oven — the steam helps the crust develop."),
-    ("Why is my sauce too thin?", "Simmer it longer without a lid to let the liquid reduce."),
-    ("What is the easiest way to peel garlic?", "Crush it with the flat of a knife — the skin comes off easily."),
-    ("How do I season a cast iron pan?", "Coat it lightly with oil and bake it upside down for an hour."),
-    ("Can I use dried herbs instead of fresh?", "Yes, but use about a third of the quantity as dried are more concentrated."),
-    ("What is the best oil for high-heat cooking?", "Oils with a high smoke point, like avocado or refined coconut oil."),
-    ("How do I know if the fish is fresh?", "It should smell like the sea, not strongly fishy, and the flesh should be firm."),
-    # ── Shopping ──────────────────────────────────────────────────────────
-    ("Do you have this in a larger size?", "Let me check the stockroom — I will be right back."),
-    ("Is there a sale on at the moment?", "Yes, twenty percent off selected items until Sunday."),
-    ("Can I return this if it does not fit?", "Yes, within thirty days with the receipt."),
-    ("How long does delivery take?", "Standard delivery is three to five working days."),
-    ("Is this covered by a warranty?", "It comes with a one-year manufacturer's warranty."),
-    ("Can I pay in instalments?", "Yes, we offer an interest-free payment plan."),
-    ("Do you offer gift wrapping?", "Yes, it is available at the checkout for a small additional charge."),
-    ("Is the price negotiable?", "I can offer you a small discount if you are buying two."),
-    ("How do I track my order?", "You will receive an email with a tracking link once it ships."),
-    ("Do you have a student discount?", "Yes, show your student ID for ten percent off."),
-    ("Can I collect this in store instead?", "Yes, click and collect is available at most of our branches."),
-    ("What happens if it arrives damaged?", "Contact us within forty-eight hours and we will arrange a replacement."),
-    ("Is this item in stock?", "I can see we have three left — shall I reserve one for you?"),
-    ("Can I place an order over the phone?", "Yes, I can take your details now if you would like to proceed."),
-    ("Is there a minimum spend for free delivery?", "Free delivery applies to orders over thirty pounds."),
-    ("Do you price match with other retailers?", "Yes, bring us the lower price and we will match it."),
-    ("Can I exchange this for a different colour?", "Of course, as long as we have your size in stock."),
-    ("What is the easiest way to cancel my order?", "Log into your account and select cancel — it only takes a moment."),
-    ("Is there a loyalty scheme I can join?", "Yes, sign up in store today and earn points on every purchase."),
-    ("How do I know which size to order?", "Our size guide is on the product page — it is very detailed."),
-    # ── Weather ───────────────────────────────────────────────────────────
-    ("Should I bring a jacket?", "Definitely — it is forecast to turn cold this afternoon."),
-    ("Is the storm going to be bad?", "They are expecting heavy rain and strong winds by evening."),
-    ("What is the weather like there in July?", "It is warm and sunny, occasionally with an afternoon shower."),
-    ("Why is it so humid today?", "A warm front has moved in from the south overnight."),
-    ("Will the snow cause any travel disruptions?", "Some routes may be affected — check updates before you leave."),
-    ("Is it safe to drive in these conditions?", "Visibility is poor, so drive slowly and leave extra distance."),
-    ("Why does the weather change so quickly here?", "The proximity to the coast makes conditions quite unpredictable."),
-    ("Do you think it will clear up by the afternoon?", "The forecast suggests a break in the clouds around three."),
-    ("How do meteorologists predict the weather?", "They use data from satellites, weather stations, and computer models."),
-    ("Is this weather normal for this time of year?", "It is a bit unusual — temperatures are running slightly above average."),
-    ("How accurate are seven-day forecasts?", "Reasonably accurate for the first three days, less so beyond that."),
-    ("What causes fog to form?", "When moist air near the ground cools rapidly, the water vapour condenses."),
-    ("Will there be a frost tonight?", "There is a chance — temperatures are forecast to drop to just below zero."),
-    ("Why does the wind feel colder than the actual temperature?", "Wind chill makes the air feel colder by drawing heat away from the skin faster."),
-    ("Is this the wettest summer on record?", "It is among the wettest in recent decades, according to the latest figures."),
-    # ── Family ────────────────────────────────────────────────────────────
-    ("Are you going to your parents' place this weekend?", "Yes, it is my mum's birthday so we are all getting together."),
-    ("How are the kids settling into their new school?", "Really well — they have already made some good friends."),
-    ("Does everyone in your family live nearby?", "Most of us do, though my brother is abroad at the moment."),
-    ("How do you manage the school run with two jobs?", "We take turns — it takes some planning but it works."),
-    ("What do you do for family holidays?", "We usually go somewhere coastal — simple and relaxing."),
-    ("Do your children enjoy reading?", "My youngest is obsessed with books at the moment."),
-    ("How do you handle screen time with young children?", "We have set agreed times and stick to them fairly well."),
-    ("Did your parents teach you to cook?", "My grandmother was the one who really got me into it."),
-    ("How often do you visit your family?", "We try to get together at least once a month."),
-    ("What is your family's favourite tradition?", "We always have a big meal together on Sunday afternoons."),
-    ("How do you balance everyone's different schedules?", "A shared calendar helps enormously — we all update it as we go."),
-    ("Do you have family rituals around the holidays?", "We always go for a walk on the morning of each holiday, whatever the weather."),
-    ("How do you deal with disagreements within the family?", "We try to talk things through calmly and give everyone a chance to be heard."),
-    ("What do your children want to be when they grow up?", "This week, one wants to be a vet and the other an astronaut."),
-    ("How did you decide on your children's names?", "We each had a list and worked through them until we found the one we both loved."),
-    # ── Hobbies ───────────────────────────────────────────────────────────
-    ("How did you get into painting?", "A friend bought me a starter kit and I was hooked instantly."),
-    ("How long have you been playing the guitar?", "About three years now — I still practice every day."),
-    ("Do you write fiction or non-fiction?", "Mostly fiction, though I dabble in essays occasionally."),
-    ("Is photography expensive to get into?", "It can be, but starting with a smartphone is perfectly fine."),
-    ("What got you into hiking?", "A colleague convinced me to join a short trail walk — I was sold."),
-    ("Do you knit or crochet?", "Both, actually — they use different techniques but complement each other."),
-    ("Have you ever sold your artwork?", "Yes, I have sold a few pieces through a local gallery."),
-    ("What kind of music do you play?", "Mostly jazz, but I enjoy classical pieces too."),
-    ("How do you find time for your hobbies?", "I wake up an hour earlier — mornings are peaceful for creative work."),
-    ("What is the hardest thing about learning a new instrument?", "Staying consistent in the early stages when progress feels slow."),
-    ("Do you do any outdoor hobbies?", "Yes, I cycle at weekends and do a bit of gardening."),
-    ("Have you tried any creative writing?", "I write short stories in my spare time — nothing serious yet."),
-    ("What made you start collecting things?", "A single find at a car boot sale — then I could not stop."),
-    ("Do you exhibit your work anywhere?", "I have taken part in a couple of open studio events."),
-    ("How do you stay motivated when a project stalls?", "I give it a few days and come back with fresh eyes."),
-    ("Is pottery harder than it looks?", "Absolutely — but the learning curve makes it all the more satisfying."),
-    ("Have you entered any competitions?", "Yes, a local photography one — I did not win but it was a great experience."),
-    ("What equipment do you recommend for a beginner?", "Start with the basics and only invest in more as you grow into the hobby."),
-    ("How has your hobby changed over the years?", "It has become more intentional — less about output, more about process."),
-    ("Do you follow any artists or makers for inspiration?", "Several — I find social media genuinely useful for creative discovery."),
-    # ── Gaming ────────────────────────────────────────────────────────────
-    ("What game are you playing at the moment?", "A really good open-world adventure — I have put hours into it."),
-    ("Do you prefer single-player or multiplayer?", "Single-player for the story, multiplayer for the social side."),
-    ("Is that game difficult?", "The early levels ease you in, but it gets quite challenging later on."),
-    ("Do you stream your gameplay?", "I have done a little, but I mostly play just for the enjoyment."),
-    ("What makes a game truly memorable?", "A great story, satisfying mechanics, and a world worth exploring."),
-    ("How do speedrunners get so fast?", "They study every frame of the game to find the most efficient path."),
-    ("Is gaming a good way to relieve stress?", "For many people, yes — it offers a real sense of escape."),
-    ("What was the first game you ever played?", "A classic platformer on an old console — I have fond memories."),
-    ("Do you prefer competitive or casual gaming?", "Casual mostly — I play to relax rather than to compete."),
-    ("What do you think of the latest update?", "Mixed feelings — some improvements, but a few things feel worse."),
-    ("Do you think games can be genuinely artistic?", "Absolutely — some tell stories in ways no other medium can."),
-    ("How do you avoid spending too much on in-game purchases?", "I set a monthly limit and treat it like any other entertainment budget."),
-    ("What genre do you spend most time in?", "RPGs mostly — I love the sense of progression and exploration."),
-    ("Is online gaming as fun as playing in person?", "Different, but it has its own appeal — especially with good friends."),
-    ("Do younger people have an advantage in competitive games?", "Reaction time helps, but game sense and experience count for a lot too."),
-    # ── Internet ──────────────────────────────────────────────────────────
-    ("Did you see that video going around?", "Yes, I saw it last night — it was incredibly well-made."),
-    ("How do you avoid falling for misinformation online?", "Cross-check with multiple reliable sources before sharing anything."),
-    ("Do you follow many people online?", "I try to keep my feed focused on things that genuinely interest me."),
-    ("Have you tried podcasts instead of music for commuting?", "Yes — I have learned so much more since making the switch."),
-    ("How do you manage being reachable all the time?", "I set specific times when I check messages and stick to them."),
-    ("Is it better to send an email or a message?", "Email for anything formal; a message is fine for quick things."),
-    ("What do you do when someone misunderstands your message?", "I clarify calmly and try to understand what led to the confusion."),
-    ("How do you communicate clearly in writing?", "Be direct, keep sentences short, and always re-read before sending."),
-    ("Do you think social media is good or bad overall?", "Like most tools, it depends entirely on how you use it."),
-    ("How do you deal with negative comments online?", "I try not to engage — it rarely leads anywhere useful."),
-    ("Have you ever taken a break from social media?", "Yes — it was quieter, and honestly quite refreshing."),
-    ("What do you use for keeping notes and ideas?", "A simple notes app — the key is actually reviewing it regularly."),
-    ("Do you think people share too much online?", "Sometimes — a bit of friction before posting can be a good thing."),
-    ("How do you find new things to read or watch?", "Recommendations from people I trust are more reliable than algorithms."),
-    ("What is your approach to managing notifications?", "Most are turned off — I check on my terms, not the app's."),
-    # ── Science and environment ───────────────────────────────────────────
-    ("Why did the experiment not work?", "The temperature was not controlled carefully enough."),
-    ("How do we know the universe is expanding?", "We observe that distant galaxies are moving away from us."),
-    ("What is the simplest way to reduce my carbon footprint?", "Eat less meat, fly less, and choose public transport where possible."),
-    ("Why do seasons change?", "Because the Earth is tilted on its axis as it orbits the sun."),
-    ("Is nuclear energy safe?", "Modern reactors have strong safety records, but waste remains a challenge."),
-    ("What causes thunder?", "It is the rapid expansion of air heated by a lightning bolt."),
-    ("How long does plastic take to decompose?", "Most plastic takes hundreds of years, some over a thousand."),
-    ("Are electric vehicles actually better for the environment?", "Over their full lifecycle, yes — though manufacturing has a cost too."),
-    ("Why is biodiversity so important?", "It keeps ecosystems stable and resilient against disruptions."),
-    ("Can individuals really make a difference for the climate?", "Every action matters, and collective small changes add up significantly."),
-    ("What happens to recycled material?", "It is sorted, processed, and made into new products — the system is imperfect but improving."),
-    ("Is there a simple way to explain photosynthesis?", "Plants use sunlight to convert water and carbon dioxide into food and oxygen."),
-    ("How does a vaccine work?", "It teaches the immune system to recognise a pathogen without causing the disease itself."),
-    ("Why do we still have questions about dark matter?", "We know it exists from its gravitational effects, but have not yet directly detected it."),
-    ("What is the most immediate threat from climate change?", "Extreme weather events, sea level rise, and disruption to food and water systems."),
-    # ── Emotions and wellbeing ────────────────────────────────────────────
-    ("How do you manage stress during busy periods?", "I try to take short breaks and focus on one thing at a time."),
-    ("What helps you feel better when you are upset?", "A walk outside usually helps me clear my head."),
-    ("How can we support a friend going through a tough time?", "Listen without judgement and let them lead the conversation."),
-    ("Is it okay to talk about mental health at work?", "Increasingly yes — workplaces are becoming more open about it."),
-    ("How do you know when you need to take a break?", "When small things start feeling overwhelming, that is usually the sign."),
-    ("What do you do when you cannot sleep?", "I try to avoid screens and read something calming instead."),
-    ("How do you stay motivated when things get hard?", "I remind myself of why I started and celebrate small progress."),
-    ("Do you have any daily habits that help your mood?", "Morning exercise and a consistent sleep routine make a big difference."),
-    ("How do you deal with criticism?", "I try to separate the message from the emotion and find what is useful."),
-    ("What is your approach to staying positive?", "I focus on what I can control and try to appreciate small wins."),
-    ("How do you handle situations where you have no control?", "I try to accept what I cannot change and focus energy on what I can."),
-    ("What do you find most draining emotionally?", "Situations where I feel unheard or where communication breaks down."),
-    ("How do you recover after a particularly hard week?", "Rest, time with people who energise me, and something completely unrelated to work."),
-    ("Do you have any rituals that help you reset?", "A long walk with no phone always does it."),
-    ("How do you help yourself through periods of low motivation?", "I reduce expectations temporarily and focus on just showing up."),
-    # ── Communication ─────────────────────────────────────────────────────
-    ("How do you start a difficult conversation?", "I try to choose the right moment and lead with empathy."),
-    ("What do you do if someone is not listening?", "I pause and ask if now is a good time to talk."),
-    ("Is it better to be direct or diplomatic?", "Both have their place — context usually guides the right approach."),
-    ("How do you disagree respectfully?", "I acknowledge their point before explaining my own perspective."),
-    ("What makes someone a great communicator?", "Clarity, listening well, and adapting to the audience."),
-    ("How do you write a professional email quickly?", "Start with the key point, be concise, and always proofread."),
-    ("How do you prepare for a big presentation?", "Know your material well, practise out loud, and anticipate questions."),
-    ("What should you avoid in a job interview?", "Speaking negatively about former employers or being too vague."),
-    ("How do you give feedback to someone who is defensive?", "Focus on the behaviour and the impact rather than the person."),
-    ("What is the best way to ask for help?", "Be specific about what you need and make it easy for the other person to say yes."),
-    ("How do you handle being talked over in a meeting?", "I pause, wait for a gap, and re-enter calmly and clearly."),
-    ("What do you do when you have misread someone's tone?", "Acknowledge it and ask directly — most people appreciate the clarification."),
-    ("How do you keep a conversation going when it stalls?", "I ask an open question about something they mentioned earlier."),
-    ("Is silence in a conversation always a bad sign?", "Not at all — comfortable silence is a mark of genuine connection."),
-    ("How do you keep email communication concise?", "State the request in the first line and move everything else to bullet points."),
-    # ── Finance ───────────────────────────────────────────────────────────
-    ("Should I start investing now or wait?", "The best time to start is usually as soon as you have an emergency fund in place."),
-    ("What is the difference between a Stocks and Shares ISA and a Cash ISA?", "One holds investments; the other is essentially a tax-free savings account."),
-    ("How do I start budgeting if I never have before?", "Track every purchase for one month first — the patterns will reveal themselves."),
-    ("Is it worth paying off my mortgage early?", "Compare the mortgage rate to what your savings could earn — the maths guides the answer."),
-    ("How much should I have in an emergency fund?", "Three to six months of essential outgoings is the standard recommendation."),
-    ("What is dollar-cost averaging?", "It means investing a fixed amount at regular intervals regardless of market conditions."),
-    ("Are index funds a good option for beginners?", "Many experts recommend them for their low costs and broad diversification."),
-    ("How does inflation affect my savings?", "If your savings earn less than inflation, the purchasing power of your money falls."),
-    ("What is the difference between a debit and a credit card?", "A debit card uses your own money; a credit card borrows money you repay later."),
-    ("Should I pay off debt before saving?", "High-interest debt should usually be cleared first — then build your savings."),
-    # ── Sport ─────────────────────────────────────────────────────────────
-    ("How do athletes stay motivated during a long season?", "Clear goals, a supportive team environment, and good recovery habits all help."),
-    ("What is the best way to avoid injury when starting to train?", "Build gradually, prioritise recovery, and listen to your body carefully."),
-    ("How important is nutrition for performance?", "Critically important — what you eat directly affects your energy and recovery."),
-    ("What makes a good coach?", "Technical knowledge, emotional intelligence, and the ability to get the best from each individual."),
-    ("Is mental strength more important than physical ability at the elite level?", "At the top, the physical differences are small — mindset often decides."),
-    ("How do you deal with a losing streak?", "Analyse without overreacting, keep training well, and trust the process."),
-    ("What is periodisation in training?", "It is a structured approach to varying training load to peak at the right time."),
-    ("How does sports psychology help athletes?", "It builds mental skills like focus, resilience, and composure under pressure."),
-    ("What separates good athletes from great ones?", "Consistency, attention to detail, and the willingness to keep improving."),
-    ("How do team sports develop life skills?", "Communication, accountability, dealing with setbacks, and working towards shared goals."),
-    # ── Music ─────────────────────────────────────────────────────────────
-    ("How do you choose what to listen to?", "Mood drives most of it — I have playlists for almost every state of mind."),
-    ("Is music theory necessary to play an instrument?", "Not essential to start, but it becomes very useful as you progress."),
-    ("How do you get over stage fright?", "Preparation is the best cure — the more you know the material, the calmer you feel."),
-    ("What is the best way to practise when you are short on time?", "Focus on the difficult passages rather than playing things you already know."),
-    ("How has streaming changed the music industry?", "It democratised access but significantly reduced per-stream revenue for artists."),
-    ("Do lyrics matter as much as the music itself?", "They can carry completely different weight depending on the listener."),
-    ("What makes a great live performance?", "Connection with the audience — technical perfection matters less than presence."),
-    ("How do you find new music you enjoy?", "Following recommendations from people with similar taste works better than algorithms."),
-    ("Is classical music harder to learn than popular music?", "The notation and technique demand more formal training, but both have their challenges."),
-    ("What role does music play in cultural identity?", "It carries history, shared memory, and a sense of belonging that little else can replicate."),
-    # ── Architecture ──────────────────────────────────────────────────────
-    ("What makes a building feel welcoming?", "Scale, natural light, and the way it meets the ground all play a role."),
-    ("How do architects account for how a building will age?", "Through material choices, maintenance planning, and designing for flexibility of use."),
-    ("Is sustainable architecture more expensive?", "Often upfront, but the whole-life costs are usually lower."),
-    ("What is the difference between a structural and an interior designer?", "One deals with how a building stands up; the other with how it feels inside."),
-    ("How does planning permission work?", "You submit designs to the local authority who assess them against planning policy."),
-    ("What is passive design?", "It uses orientation, insulation, and ventilation to regulate temperature without mechanical systems."),
-    ("How do you renovate a listed building?", "Carefully — changes require consent and must respect the character of the building."),
-    ("What is the most challenging part of designing a public building?", "Meeting the needs of many different users while keeping the space coherent."),
-    ("How does architecture influence behaviour?", "Space affects how people move, interact, and feel — good design does this intentionally."),
-    ("What is brutalism?", "An architectural movement using exposed concrete and bold geometric forms, prominent from the 1950s."),
-    # ── Law ───────────────────────────────────────────────────────────────
-    ("What is the difference between a solicitor and a barrister?", "Solicitors advise clients; barristers typically argue cases in higher courts."),
-    ("How does small claims court work?", "It handles lower-value disputes with simplified procedures and no need for a lawyer."),
-    ("What is legal aid?", "State-funded legal support for those who cannot afford private representation."),
-    ("Can a verbal agreement be legally binding?", "Yes, though proving the terms can be difficult without written evidence."),
-    ("What does without prejudice mean?", "It means a communication cannot be used as evidence in court proceedings."),
-    ("How long does it take to get a court date?", "It varies widely — from weeks to over a year depending on the court and case type."),
-    ("What is the burden of proof in a civil case?", "The claimant must show their case is more likely than not — the balance of probabilities."),
-    ("What happens if I miss a court date?", "The court may proceed without you, which often leads to a judgment against you."),
-    ("Is a contract valid without a witness?", "In most cases yes, but certain contracts — like wills — require witnessed signatures."),
-    ("What is the difference between a fine and a penalty?", "In most contexts they are interchangeable, though a fine is usually a fixed financial sum."),
-    # ── History ───────────────────────────────────────────────────────────
-    ("How do we know what ancient civilisations were like?", "Through archaeology, written records, and material culture where it survives."),
-    ("Was history always written by the victors?", "Often, yes — which is why historians now work hard to recover silenced perspectives."),
-    ("What was daily life like in medieval Europe?", "Demanding and short by modern standards, but communities had rich social and cultural lives."),
-    ("How significant was the printing press?", "Transformative — it enabled the rapid spread of ideas and is linked to the Reformation."),
-    ("Why do we study history?", "To understand how we got here, avoid repeating mistakes, and appreciate the present."),
-    ("Was the Roman Empire really in decline for centuries?", "Historians debate the timeline, but yes, it was a gradual process with many causes."),
-    ("How do oral histories compare to written records?", "They capture experiences the written record misses, but require careful interpretation."),
-    ("What caused the collapse of ancient civilisations?", "Usually a combination of climate, resource stress, internal conflict, and external pressures."),
-    ("How reliable are ancient historical accounts?", "Patchy — bias, exaggeration, and gaps are common, so cross-referencing is essential."),
-    ("Is there such a thing as an objective history?", "Historians aim for it, but every account involves choices about what to include and how."),
-    # ── Arts ──────────────────────────────────────────────────────────────
-    ("What makes art meaningful?", "When it creates a genuine connection between the work and the person experiencing it."),
-    ("Should art always have a message?", "Not necessarily — some of the most powerful work resists straightforward interpretation."),
-    ("How do you respond to art you do not understand?", "Sit with the discomfort — understanding often comes later, or the response itself is enough."),
-    ("Is art subjective?", "Partly, but shared aesthetic and cultural frameworks mean some responses are more widely held."),
-    ("How has art changed since the internet?", "Distribution has democratised, but so has the noise — discoverability remains a challenge."),
-    ("What is the difference between fine art and commercial art?", "Fine art is made primarily for its own sake; commercial art serves a specific client purpose."),
-    ("How do artists price their work?", "Time, materials, market position, and reputation all factor in — it is rarely straightforward."),
-    ("What is the role of the arts in education?", "Creativity, critical thinking, and emotional intelligence are all developed through arts engagement."),
-    ("Is public funding for the arts justified?", "The economic, social, and cultural returns are well-documented — the case is strong."),
-    ("How do you know when a piece of work is finished?", "Often when removing anything more would take something away — though the line is subjective."),
-    # ── Mental health ─────────────────────────────────────────────────────
-    ("What should I do if I think a friend is struggling?", "Check in gently, listen without rushing to fix things, and ask what they need."),
-    ("Is therapy effective?", "For most people and most conditions, yes — particularly evidence-based approaches like CBT."),
-    ("How do I know if I need professional help?", "If your distress is persistent, affecting daily life, or feels unmanageable alone."),
-    ("What is the difference between feeling sad and being depressed?", "Depression is more persistent, pervasive, and typically interferes significantly with daily function."),
-    ("Can exercise really help with anxiety?", "Yes — regular physical activity is one of the most evidence-supported interventions available."),
-    ("How do I find a therapist I can trust?", "Look for someone qualified, registered, and with experience in what you are dealing with."),
-    ("What is mindfulness actually about?", "Paying deliberate, non-judgmental attention to the present moment."),
-    ("Is it possible to have too much self-awareness?", "Rumination can tip into unhealthy territory — the aim is reflection, not self-criticism."),
-    ("How do you build resilience?", "Through experience of overcoming difficulty, good relationships, and a sense of meaning."),
-    ("What is the link between sleep and mental health?", "Bidirectional and strong — poor sleep worsens most conditions, and distress disrupts sleep."),
-    # ── Transport ─────────────────────────────────────────────────────────
-    ("Is cycling safe in cities?", "It is improving with better infrastructure, but conditions vary significantly by city."),
-    ("What is the environmental impact of flying?", "Significant — aviation accounts for a notable share of transport-related emissions."),
-    ("How does congestion charging work?", "Drivers pay a fee to enter a defined zone, which reduces traffic and funds alternatives."),
-    ("What are the benefits of public transport over driving?", "Lower emissions, reduced road congestion, and often cheaper at scale."),
-    ("How long do electric vehicle batteries last?", "Most are designed to retain around eighty percent capacity after a decade of use."),
-    ("What is the future of self-driving vehicles?", "Progress is real but regulatory and safety challenges mean full autonomy is still some way off."),
-    ("Why is rail travel often more expensive than flying?", "Infrastructure costs and pricing structures — though the full environmental cost of flying is underpriced."),
-    ("How do cities reduce car dependency?", "Through investment in public transport, cycling, walking, and mixed-use development."),
-    ("What makes a transport network equitable?", "Affordability, reliability, and coverage that serves everyone, not just dense urban areas."),
-    ("Is high-speed rail worth the investment?", "The evidence from countries with it suggests yes — if demand and network design are right."),
-    # ── Education policy ──────────────────────────────────────────────────
-    ("Should university be free?", "The evidence on the effects of fees is complex — both access and quality are affected."),
-    ("Are standardised tests a fair way to assess pupils?", "They measure some things well but miss much of what matters in a good education."),
-    ("How should schools handle smartphone use?", "Clear policies, consistently enforced, with genuine discussion about why they exist."),
-    ("What makes a great teacher?", "Deep subject knowledge, genuine care for pupils, and the ability to adapt."),
-    ("How do we close the attainment gap?", "Early years investment, teacher quality, and removing barriers to learning outside school."),
-    ("Is homework beneficial?", "For older pupils, well-designed homework helps — for younger children, the evidence is weaker."),
-    ("Should arts subjects receive equal funding to STEM?", "A rounded education needs both — and the evidence for arts' benefits is strong."),
-    ("How do we attract and retain great teachers?", "Pay, workload, autonomy, and genuine professional development all matter."),
-    ("What is the purpose of education?", "A contested question — but most would include knowledge, capability, and citizenship."),
-    ("Do smaller class sizes improve outcomes?", "The evidence is positive but modest — teacher quality matters more."),
+    pair for pairs in DIALOGUE_SECTIONS.values() for pair in pairs
 ]
+
+# ════════════════════════════════════════════════════════════════════════════
+# CONTENT REGISTRIES  —  every source addressable by name
+# ════════════════════════════════════════════════════════════════════════════
+
+DOMAINS.update(EXTRA_DOMAINS)
+
+# Standalone / phrase pools, keyed by short name (used by categories.py).
+POOLS: dict[str, list[str]] = {
+    "beginner":          STANDALONE_BEGINNER,
+    "intermediate":      STANDALONE_INTERMEDIATE,
+    "advanced":          STANDALONE_ADVANCED,
+    "social_media":      STANDALONE_SOCIAL_MEDIA,
+    "customer_support":  STANDALONE_CUSTOMER_SUPPORT,
+    "child_friendly":    STANDALONE_CHILD_FRIENDLY,
+    "instructional":     STANDALONE_INSTRUCTIONAL,
+    "storytelling":      STANDALONE_STORYTELLING,
+    "news":              STANDALONE_NEWS,
+    "philosophy":        STANDALONE_PHILOSOPHY,
+    "science_facts":     STANDALONE_SCIENCE_FACTS,
+    "greetings":         DAILY_GREETINGS,
+    "farewells":         DAILY_FAREWELLS,
+    "introductions":     DAILY_INTRODUCTIONS,
+    "small_talk":        DAILY_SMALL_TALK,
+    "asking_directions": DAILY_ASKING_DIRECTIONS,
+    "making_requests":   DAILY_MAKING_REQUESTS,
+    "apologies_gratitude": DAILY_APOLOGIES_GRATITUDE,
+    "phone_calls":       DAILY_PHONE_CALLS,
+    "restaurant_cafe":   DAILY_RESTAURANT_CAFE,
+    "expressing_feelings": DAILY_EXPRESSING_FEELINGS,
+    "compliments":       DAILY_COMPLIMENTS,
+    "making_plans":      DAILY_MAKING_PLANS,
+    "shopping_phrases":  DAILY_SHOPPING_PHRASES,
+    "transport_phrases": DAILY_TRANSPORT_PHRASES,
+    "emergencies_help":  DAILY_EMERGENCIES_HELP,
+    "numbers_time_date": DAILY_NUMBERS_TIME_DATE,
+    "accommodation":     DAILY_ACCOMMODATION,
+    "polite_phrases":    DAILY_POLITE_PHRASES,
+}
+POOLS.update(EXTRA_POOLS)
+
+# Pools written as spoken, ready-to-use phrases. The daily_interaction
+# strategy draws from these directly instead of templating a sentence.
+CONVERSATIONAL_POOLS: frozenset[str] = frozenset({
+    "greetings", "farewells", "introductions", "small_talk",
+    "asking_directions", "making_requests", "apologies_gratitude",
+    "phone_calls", "restaurant_cafe", "expressing_feelings", "compliments",
+    "making_plans", "shopping_phrases", "transport_phrases",
+    "emergencies_help", "numbers_time_date", "accommodation",
+    "polite_phrases", "basics_everyday", "customer_support",
+})
 
 # ════════════════════════════════════════════════════════════════════════════
 # CONTENT SAFETY FILTER
@@ -2929,9 +4285,16 @@ DIALOGUE_PAIRS: list[tuple[str, str]] = [
 _BLOCKED_TERMS: frozenset[str] = frozenset([
     "kill", "murder", "weapon", "gun", "bomb", "drug", "alcohol",
     "hate", "racist", "sex", "nude", "violence", "terror",
-    "suicide", "blood", "hurt", "abuse", "illegal", "exploit",
+    "suicide", "blood", "abuse", "illegal",
     "threaten", "assault", "steal", "cheat", "fraud",
 ])
+
+# Whole-word matching only. Substring matching used to drop innocent
+# sentences ("skill" → "kill", "begun" → "gun", "exploits" → "exploit").
+_BLOCKED_RE = re.compile(
+    r"\b(?:" + "|".join(sorted(map(re.escape, _BLOCKED_TERMS))) + r")\w*\b",
+    re.IGNORECASE,
+)
 
 # ════════════════════════════════════════════════════════════════════════════
 # GENERATOR CONFIG
@@ -2944,17 +4307,132 @@ STRATEGIES = [
     "structured", "standalone", "transition", "time", "filler",
     "question", "dialogue_q", "dialogue_a", "compound",
     "conditional", "comparison", "exclamation", "passive", "narrative",
-    # New strategies
+    # v3 strategies
     "rhetorical_question", "aphorism", "anecdote_opener", "imperative",
     "hypothetical", "reported_speech", "causal_chain", "sensory",
     "analogy", "proverb_twist", "future_tense", "enumeration",
     "reflection", "definition", "news_headline",
+    # v4 strategy
+    "daily_interaction",
 ]
 STRATEGY_WEIGHTS = [
-    28, 14, 8, 8, 6, 6, 4, 4, 5, 3, 2, 1, 2, 1,
-    # New strategy weights
+    22, 12, 7, 7, 5, 5, 4, 4, 5, 3, 2, 1, 2, 1,
+    # v3 weights
     3, 3, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+    # v4 weight — high because this is the translator-app core
+    18,
 ]
+
+# Strategies that template a sentence out of a DOMAINS entry.
+_DOMAIN_STRATEGIES: frozenset[str] = frozenset({
+    "structured", "transition", "time", "filler", "question", "compound",
+    "conditional", "comparison", "exclamation", "passive", "anecdote_opener",
+    "reported_speech", "causal_chain", "sensory", "future_tense",
+    "reflection", "news_headline",
+})
+_DIALOGUE_STRATEGIES: frozenset[str] = frozenset({"dialogue_q", "dialogue_a"})
+_POOL_STRATEGIES: frozenset[str] = frozenset({"standalone", "daily_interaction",
+                                              "narrative"})
+
+# Topic-neutral banks. Fine for an unrestricted run, but they dilute a
+# category-specific one, so they are damped unless a category asks for them.
+_TOPIC_NEUTRAL: frozenset[str] = frozenset({
+    "aphorism", "imperative", "hypothetical", "analogy", "proverb_twist",
+    "enumeration", "definition", "rhetorical_question",
+})
+_NEUTRAL_DAMPING = 0.2
+
+
+def _decap(subject: str) -> str:
+    """
+    Lower-case a subject for mid-sentence use without flattening acronyms.
+
+    "The student"      -> "the student"
+    "International NGOs" -> "international NGOs"
+    "NASA researchers" -> "NASA researchers"
+    """
+    head = subject.partition(" ")[0]
+    if len(head) > 1 and head[1:] != head[1:].lower():
+        return subject          # NGOs, iPhone, NASA …
+    return subject[0].lower() + subject[1:]
+
+
+def _resolve_sources(
+    selection: Sequence[str],
+) -> tuple[list[str], list[str], list[str], dict[str, float]]:
+    """
+    Turn resolved category keys into concrete content sources.
+
+    An empty selection means "everything". Returns
+    (domain names, pool names, dialogue section names, strategy bias).
+    """
+    if not selection:
+        return list(DOMAINS), list(POOLS), list(DIALOGUE_SECTIONS), {}
+
+    domains: list[str] = []
+    pools: list[str] = []
+    dialogue: list[str] = []
+    bias_totals: dict[str, float] = {}
+
+    def _collect(names: Iterable[str], registry: dict, target: list[str],
+                 kind: str, owner: str) -> None:
+        for name in names:
+            if name not in registry:
+                logger.warning("Category '%s' references unknown %s '%s' — skipped.",
+                               owner, kind, name)
+            elif name not in target:
+                target.append(name)
+
+    for key in selection:
+        category = cat_registry.CATEGORIES[key]
+        _collect(category.domains, DOMAINS, domains, "domain", key)
+        _collect(category.pools, POOLS, pools, "pool", key)
+        _collect(category.dialogue, DIALOGUE_SECTIONS, dialogue, "dialogue section", key)
+        for strategy, factor in category.bias.items():
+            bias_totals[strategy] = bias_totals.get(strategy, 0.0) + factor
+
+    # Average the multipliers so mixing categories does not compound them.
+    counts: dict[str, int] = {}
+    for key in selection:
+        for strategy in cat_registry.CATEGORIES[key].bias:
+            counts[strategy] = counts.get(strategy, 0) + 1
+    bias = {s: total / counts[s] for s, total in bias_totals.items()}
+
+    if not pools:
+        pools = ["beginner", "intermediate"]
+    return domains, pools, dialogue, bias
+
+
+def _build_strategy_weights(
+    bias: dict[str, float],
+    *,
+    restricted: bool,
+    has_domains: bool,
+    has_dialogue: bool,
+    has_pools: bool,
+) -> tuple[list[str], list[float]]:
+    """Filter strategies to those the selected content can actually support."""
+    names: list[str] = []
+    weights: list[float] = []
+
+    for strategy, base in zip(STRATEGIES, STRATEGY_WEIGHTS):
+        if strategy in _DOMAIN_STRATEGIES and not has_domains:
+            continue
+        if strategy in _DIALOGUE_STRATEGIES and not has_dialogue:
+            continue
+        if strategy in _POOL_STRATEGIES and not has_pools:
+            continue
+
+        weight = float(base) * bias.get(strategy, 1.0)
+        if restricted and strategy in _TOPIC_NEUTRAL and strategy not in bias:
+            weight *= _NEUTRAL_DAMPING
+        if weight > 0:
+            names.append(strategy)
+            weights.append(weight)
+
+    if not names:  # pathological selection — fall back to plain phrases
+        return ["standalone"], [1.0]
+    return names, weights
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -2989,33 +4467,97 @@ class SentenceGenerator:
     - Extended paraphrase map (80+ entries)
     """
 
-    def __init__(self, seed: int = 42) -> None:
+    def __init__(self, seed: int = 42,
+                 seen_hashes_file: Optional[Path] = None,
+                 categories: Optional[Sequence[str]] = None) -> None:
         self._rng = random.Random(seed)
-        self._seen: set[int] = set()
-        self._domain_names = list(DOMAINS.keys())
+        self._seen_hashes_file = seen_hashes_file
+        self._seen: set[int] = self._load_seen_hashes(seen_hashes_file)
 
-        self._standalone_pool: list[tuple[str, str]] = []
-        for lst, tag in [
-            (STANDALONE_BEGINNER, "beginner"),
-            (STANDALONE_INTERMEDIATE, "intermediate"),
-            (STANDALONE_ADVANCED, "advanced"),
-            (STANDALONE_SOCIAL_MEDIA, "social"),
-            (STANDALONE_CUSTOMER_SUPPORT, "support"),
-            (STANDALONE_CHILD_FRIENDLY, "child"),
-            (STANDALONE_INSTRUCTIONAL, "instructional"),
-            (STANDALONE_STORYTELLING, "story"),
-            (STANDALONE_NEWS, "news"),
-            (STANDALONE_PHILOSOPHY, "philosophy"),
-            (STANDALONE_SCIENCE_FACTS, "science_facts"),
-        ]:
-            for s in lst:
-                self._standalone_pool.append((tag, s))
+        # ── Resolve the selected categories into concrete content sources ──
+        self.categories: list[str] = cat_registry.expand(list(categories or []))
+        domain_names, pool_names, dialogue_names, bias = _resolve_sources(self.categories)
+
+        self._domain_names = domain_names
+
+        self._standalone_pool: list[tuple[str, str]] = [
+            (name, sentence)
+            for name in pool_names
+            for sentence in POOLS[name]
+        ]
         self._rng.shuffle(self._standalone_pool)
 
-        self._dialogue_qs = [q for q, _ in DIALOGUE_PAIRS]
-        self._dialogue_as = [a for _, a in DIALOGUE_PAIRS]
+        # Ready-to-use spoken phrases feeding the daily_interaction strategy.
+        self._daily_pool: list[str] = [
+            sentence
+            for name in pool_names if name in CONVERSATIONAL_POOLS
+            for sentence in POOLS[name]
+        ] or [s for _, s in self._standalone_pool]
+        self._rng.shuffle(self._daily_pool)
+
+        self._dialogue_pairs = [pair for name in dialogue_names
+                                for pair in DIALOGUE_SECTIONS[name]]
+        self._dialogue_qs = [q for q, _ in self._dialogue_pairs]
+        self._dialogue_as = [a for _, a in self._dialogue_pairs]
+
+        self._narrative_source = (
+            POOLS["storytelling"] if "storytelling" in pool_names
+            else [s for _, s in self._standalone_pool]
+        )
+
+        self._strategies, self._strategy_weights = _build_strategy_weights(
+            bias,
+            restricted=bool(self.categories),
+            has_domains=bool(self._domain_names),
+            has_dialogue=bool(self._dialogue_pairs),
+            has_pools=bool(self._standalone_pool),
+        )
+
+    # ── Introspection ──────────────────────────────────────────────────
+
+    def describe_selection(self) -> str:
+        """One-line summary of what this generator will draw from."""
+        label = ", ".join(self.categories) if self.categories else "all"
+        return (f"{label}: {len(self._domain_names)} domains, "
+                f"{len(self._standalone_pool)} phrases, "
+                f"{len(self._dialogue_pairs)} dialogue pairs")
+
+    # ── Persistent deduplication cache ─────────────────────────────────
+
+    @staticmethod
+    def _load_seen_hashes(path: Optional[Path]) -> set[int]:
+        """
+        Load previously generated sentence hashes from a binary cache file.
+
+        Format: raw little-endian uint64 values, 8 bytes each.
+        Returns an empty set if the file does not exist or path is None.
+        """
+        if path is None or not path.exists():
+            return set()
+        data = path.read_bytes()
+        count = len(data) // 8
+        if count == 0:
+            return set()
+        return set(struct.unpack_from(f"<{count}Q", data))
+
+    def _save_seen_hashes(self, path: Optional[Path]) -> None:
+        """
+        Persist the in-memory dedup set to disk as packed little-endian uint64s.
+        Overwrites the existing file atomically (write to .tmp then rename).
+        No-op when path is None.
+        """
+        if path is None:
+            return
+        hashes = list(self._seen)
+        packed = struct.pack(f"<{len(hashes)}Q", *hashes)
+        tmp = path.with_suffix(".bin.tmp")
+        tmp.write_bytes(packed)
+        tmp.replace(path)
+        logger.debug("Saved %d hashes to %s", len(hashes), path)
 
     # ── Public ─────────────────────────────────────────────────────────
+
+    _CACHE_FLUSH_EVERY = 50_000
 
     def stream(self, total: int) -> Generator[Row, None, None]:
         produced = 0
@@ -3024,6 +4566,11 @@ class SentenceGenerator:
             if row is not None:
                 produced += 1
                 yield row
+                # Checkpoint, so an interrupted long run keeps its dedup work
+                if produced % self._CACHE_FLUSH_EVERY == 0:
+                    self._save_seen_hashes(self._seen_hashes_file)
+        # Persist the updated dedup cache so the next run skips all these rows
+        self._save_seen_hashes(self._seen_hashes_file)
 
     # ── Dispatch ───────────────────────────────────────────────────────
 
@@ -3042,7 +4589,8 @@ class SentenceGenerator:
         return Row(id=row_id, english_text=text)
 
     def _build_sentence(self) -> str:
-        strategy = self._rng.choices(STRATEGIES, weights=STRATEGY_WEIGHTS, k=1)[0]
+        strategy = self._rng.choices(self._strategies,
+                                     weights=self._strategy_weights, k=1)[0]
         dispatch = {
             "structured":        self._structured_sentence,
             "standalone":        self._standalone_sentence,
@@ -3074,6 +4622,8 @@ class SentenceGenerator:
             "reflection":        self._reflection_sentence,
             "definition":        self._definition_sentence,
             "news_headline":     self._news_headline_sentence,
+            # v4
+            "daily_interaction": self._daily_interaction_sentence,
         }
         return dispatch[strategy]()
 
@@ -3106,21 +4656,22 @@ class SentenceGenerator:
             sent = f"{subj} recently {verb} {obj} {extra}"
         elif t == 3:
             conj = self._rng.choice(CONJUNCTIONS)
-            sent = f"{subj} {verb} {obj} {conj} the outcome was {extra}"
+            outcome = self._rng.choice(OUTCOME_CLAUSES)
+            sent = f"{subj} {verb} {obj} {conj} {outcome}"
         elif t == 4:
-            sent = f"After some thought, {subj.lower()} {verb} {obj} {extra}"
+            sent = f"After some thought, {_decap(subj)} {verb} {obj} {extra}"
         elif t == 5:
-            sent = f"It is interesting how {subj.lower()} {verb} {obj} {extra}"
+            sent = f"It is interesting how {_decap(subj)} {verb} {obj} {extra}"
         elif t == 6:
-            sent = f"Remarkably, {subj.lower()} {verb} {obj} {extra}"
+            sent = f"Remarkably, {_decap(subj)} {verb} {obj} {extra}"
         elif t == 7:
-            sent = f"In many cases, {subj.lower()} {verb} {obj} {extra}"
+            sent = f"In many cases, {_decap(subj)} {verb} {obj} {extra}"
         elif t == 8:
-            sent = f"Unexpectedly, {subj.lower()} {verb} {obj} {extra}"
+            sent = f"Unexpectedly, {_decap(subj)} {verb} {obj} {extra}"
         elif t == 9:
-            sent = f"Despite the circumstances, {subj.lower()} {verb} {obj} {extra}"
+            sent = f"Despite the circumstances, {_decap(subj)} {verb} {obj} {extra}"
         else:
-            sent = f"Without hesitation, {subj.lower()} {verb} {obj} {extra}"
+            sent = f"Without hesitation, {_decap(subj)} {verb} {obj} {extra}"
         return self._capitalise_clean(sent)
 
     def _standalone_sentence(self) -> str:
@@ -3132,21 +4683,21 @@ class SentenceGenerator:
         _, domain = self._pick_domain()
         diff = self._pick_difficulty()
         subj, verb, obj, _ = self._domain_parts(domain, diff)
-        return self._capitalise_clean(f"{transition} {subj.lower()} {verb} {obj}.")
+        return self._capitalise_clean(f"{transition} {_decap(subj)} {verb} {obj}.")
 
     def _time_sentence(self) -> str:
         phrase = self._rng.choice(TIME_PHRASES)
         _, domain = self._pick_domain()
         diff = self._pick_difficulty()
         subj, verb, obj, _ = self._domain_parts(domain, diff)
-        return self._capitalise_clean(f"{phrase} {subj.lower()} {verb} {obj}.")
+        return self._capitalise_clean(f"{phrase} {_decap(subj)} {verb} {obj}.")
 
     def _filler_sentence(self) -> str:
         opener = self._rng.choice(FILLER_OPENERS)
         _, domain = self._pick_domain()
         diff = self._pick_difficulty()
         subj, verb, obj, _ = self._domain_parts(domain, diff)
-        return self._capitalise_clean(f"{opener} {subj.lower()} {verb} {obj}.")
+        return self._capitalise_clean(f"{opener} {_decap(subj)} {verb} {obj}.")
 
     def _domain_question(self) -> str:
         _, domain = self._pick_domain()
@@ -3166,7 +4717,7 @@ class SentenceGenerator:
         s1, v1, o1, _ = self._domain_parts(d1, diff)
         s2, v2, o2, _ = self._domain_parts(d2, diff)
         conj = self._rng.choice(CONJUNCTIONS)
-        return self._capitalise_clean(f"{s1} {v1} {o1}, {conj} {s2.lower()} {v2} {o2}.")
+        return self._capitalise_clean(f"{s1} {v1} {o1}, {conj} {_decap(s2)} {v2} {o2}.")
 
     def _conditional_sentence(self) -> str:
         opener = self._rng.choice(CONDITION_OPENERS)
@@ -3174,14 +4725,14 @@ class SentenceGenerator:
         diff = self._pick_difficulty()
         subj, verb, obj, _ = self._domain_parts(domain, diff)
         middle = self._rng.choice(CONDITIONAL_MIDDLES)
-        return self._capitalise_clean(f"{opener} {subj.lower()} {verb} {obj}, and {middle}")
+        return self._capitalise_clean(f"{opener} {_decap(subj)} {verb} {obj}, and {middle}")
 
     def _comparison_sentence(self) -> str:
         starter = self._rng.choice(COMPARISON_STARTERS)
         _, domain = self._pick_domain()
         diff = self._pick_difficulty()
         subj, verb, obj, extra = self._domain_parts(domain, diff)
-        return self._capitalise_clean(f"{starter} {subj.lower()} {verb} {obj} {extra}")
+        return self._capitalise_clean(f"{starter} {_decap(subj)} {verb} {obj} {extra}")
 
     def _exclamation_sentence(self) -> str:
         opener = self._rng.choice(EXCLAMATION_OPENERS)
@@ -3196,10 +4747,10 @@ class SentenceGenerator:
         diff = self._pick_difficulty()
         subj, verb, obj, extra = self._domain_parts(domain, diff)
         be = "were" if " and " in obj else "was"
-        return self._capitalise_clean(f"{obj.capitalize()} {be} {verb} by {subj.lower()} {extra}")
+        return self._capitalise_clean(f"{obj.capitalize()} {be} {verb} by {_decap(subj)} {extra}")
 
     def _narrative_sentence(self) -> str:
-        story = self._rng.choice(STANDALONE_STORYTELLING)
+        story = self._rng.choice(self._narrative_source)
         middle = self._rng.choice(NARRATIVE_MIDDLES)
         base = story.rstrip(".!?")
         return self._capitalise_clean(f"{base}, {middle}")
@@ -3217,7 +4768,7 @@ class SentenceGenerator:
         _, domain = self._pick_domain()
         diff = self._pick_difficulty()
         subj, verb, obj, extra = self._domain_parts(domain, diff)
-        return self._capitalise_clean(f"{opener} {subj.lower()} {verb} {obj} {extra}")
+        return self._capitalise_clean(f"{opener} {_decap(subj)} {verb} {obj} {extra}")
 
     def _imperative_sentence(self) -> str:
         return self._light_paraphrase(self._rng.choice(IMPERATIVES))
@@ -3230,7 +4781,7 @@ class SentenceGenerator:
         _, domain = self._pick_domain()
         diff = self._pick_difficulty()
         subj, verb, obj, extra = self._domain_parts(domain, diff)
-        return self._capitalise_clean(f"{starter} {subj.lower()} {verb} {obj} {extra}")
+        return self._capitalise_clean(f"{starter} {_decap(subj)} {verb} {obj} {extra}")
 
     def _causal_chain_sentence(self) -> str:
         _, d1 = self._pick_domain()
@@ -3240,7 +4791,7 @@ class SentenceGenerator:
         s2, v2, o2, e2 = self._domain_parts(d2, diff)
         connector = self._rng.choice(CAUSAL_CONNECTORS)
         return self._capitalise_clean(
-            f"{s1} {v1} {o1}, {connector} {s2.lower()} {v2} {o2} {e2}"
+            f"{s1} {v1} {o1}, {connector} {_decap(s2)} {v2} {o2} {e2}"
         )
 
     def _sensory_sentence(self) -> str:
@@ -3248,7 +4799,7 @@ class SentenceGenerator:
         _, domain = self._pick_domain()
         diff = self._pick_difficulty()
         subj, verb, obj, extra = self._domain_parts(domain, diff)
-        return self._capitalise_clean(f"{opener} {subj.lower()} {verb} {obj} {extra}")
+        return self._capitalise_clean(f"{opener} {_decap(subj)} {verb} {obj} {extra}")
 
     def _analogy_sentence(self) -> str:
         starter = self._rng.choice(ANALOGY_STARTERS)
@@ -3259,14 +4810,15 @@ class SentenceGenerator:
         return self._light_paraphrase(self._rng.choice(PROVERB_TWISTS))
 
     def _future_tense_sentence(self) -> str:
+        # Domain verbs are stored in the past tense, so the future frame
+        # supplies its own verb phrase rather than conjugating theirs.
         starter = self._rng.choice(FUTURE_STARTERS)
         _, domain = self._pick_domain()
         diff = self._pick_difficulty()
         subj, _, obj, extra = self._domain_parts(domain, diff)
-        future_verb = self._rng.choice(["will", "is likely to", "may", "could", "is expected to"])
-        verb_base = self._rng.choice(domain[f"verbs_{diff[0]}"])
+        phrase = self._rng.choice(FUTURE_VERB_PHRASES)
         return self._capitalise_clean(
-            f"{starter} {subj.lower()} {future_verb} {verb_base} {obj} {extra}"
+            f"{starter} {_decap(subj)} {phrase} {obj} {extra}"
         )
 
     def _enumeration_sentence(self) -> str:
@@ -3279,7 +4831,7 @@ class SentenceGenerator:
         _, domain = self._pick_domain()
         diff = self._pick_difficulty()
         subj, verb, obj, extra = self._domain_parts(domain, diff)
-        return self._capitalise_clean(f"{starter} {subj.lower()} {verb} {obj} {extra}")
+        return self._capitalise_clean(f"{starter} {_decap(subj)} {verb} {obj} {extra}")
 
     def _definition_sentence(self) -> str:
         opener = self._rng.choice(DEFINITION_OPENERS)
@@ -3291,7 +4843,24 @@ class SentenceGenerator:
         _, domain = self._pick_domain()
         diff = self._pick_difficulty()
         subj, verb, obj, extra = self._domain_parts(domain, diff)
-        return self._capitalise_clean(f"{starter} {subj.lower()} {verb} {obj} {extra}")
+        return self._capitalise_clean(f"{starter} {_decap(subj)} {verb} {obj} {extra}")
+
+    def _daily_interaction_sentence(self) -> str:
+        """Pick a sentence directly from the daily interaction pools.
+
+        With 40 % probability returns a paraphrased standalone daily phrase.
+        With 60 % probability returns either the Q or A side of a conversational
+        dialogue pair so the output contains natural back-and-forth fragments.
+        """
+        if self._rng.random() < 0.40 or not self._dialogue_pairs:
+            return self._capitalise_clean(
+                self._light_paraphrase(self._rng.choice(self._daily_pool))
+            )
+        # pick a full dialogue pair and return one side
+        q, a = self._rng.choice(self._dialogue_pairs)
+        return self._capitalise_clean(
+            self._light_paraphrase(self._rng.choice([q, a]))
+        )
 
     # ── Paraphrase ─────────────────────────────────────────────────────
 
@@ -3299,72 +4868,35 @@ class SentenceGenerator:
         "always":       ["consistently", "regularly", "typically", "generally", "invariably"],
         "very":         ["quite", "really", "fairly", "rather", "particularly"],
         "good":         ["great", "excellent", "solid", "strong", "fine"],
-        "important":    ["essential", "significant", "valuable", "key", "critical"],
+        "important":    ["essential", "significant", "valuable", "key", "critical",
+                         "crucial", "fundamental"],
         "often":        ["frequently", "regularly", "commonly", "usually", "routinely"],
-        "show":         ["demonstrate", "reveal", "illustrate", "highlight", "indicate"],
-        "get":          ["obtain", "receive", "acquire", "gain", "secure"],
-        "make":         ["create", "produce", "develop", "build", "generate"],
-        "use":          ["apply", "employ", "utilise", "leverage", "adopt"],
         "big":          ["large", "significant", "major", "substantial", "considerable"],
         "small":        ["minor", "little", "slight", "modest", "limited"],
         "happy":        ["pleased", "content", "delighted", "glad", "thrilled"],
         "difficult":    ["challenging", "demanding", "complex", "tough", "tricky"],
         "easy":         ["simple", "straightforward", "effortless", "manageable", "accessible"],
-        "fast":         ["quickly", "rapidly", "swiftly", "promptly", "efficiently"],
         "new":          ["recent", "latest", "modern", "updated", "fresh"],
-        "start":        ["begin", "initiate", "launch", "commence", "kick off"],
-        "help":         ["assist", "support", "aid", "facilitate", "guide"],
-        "see":          ["observe", "notice", "spot", "identify", "recognise"],
-        "think":        ["believe", "consider", "feel", "reckon", "suppose"],
-        "need":         ["require", "demand", "call for", "depend on", "rely on"],
-        "learn":        ["discover", "understand", "grasp", "pick up", "absorb"],
-        "keep":         ["maintain", "sustain", "continue", "preserve", "retain"],
         "old":          ["established", "traditional", "long-standing", "existing", "prior"],
         "many":         ["numerous", "several", "various", "multiple", "a range of"],
         "really":       ["genuinely", "truly", "actually", "indeed", "notably"],
         "just":         ["simply", "only", "merely", "precisely", "exactly"],
-        "still":        ["continuing", "yet", "even now", "to this day", "as before"],
         "wrong":        ["incorrect", "mistaken", "inaccurate", "flawed", "erroneous"],
-        "right":        ["correct", "accurate", "appropriate", "suitable", "valid"],
-        "change":       ["adjust", "adapt", "modify", "revise", "transform"],
-        "clear":        ["evident", "apparent", "obvious", "transparent", "understandable"],
-        "work":         ["function", "operate", "perform", "succeed", "progress"],
         "best":         ["optimal", "most effective", "ideal", "top", "preferred"],
         "different":    ["alternative", "distinct", "varied", "diverse", "contrasting"],
         "enough":       ["sufficient", "adequate", "satisfactory", "suitable", "ample"],
         "local":        ["community-based", "nearby", "regional", "area", "neighbourhood"],
-        "share":        ["distribute", "communicate", "pass on", "exchange", "relay"],
         # Extended entries
         "better":       ["improved", "stronger", "more effective", "superior", "more capable"],
         "worse":        ["weaker", "less effective", "more problematic", "diminished", "poorer"],
         "quickly":      ["rapidly", "swiftly", "promptly", "without delay", "at pace"],
         "slowly":       ["gradually", "steadily", "at a measured pace", "carefully", "over time"],
-        "try":          ["attempt", "endeavour", "aim", "seek to", "work to"],
-        "find":         ["discover", "identify", "locate", "uncover", "detect"],
-        "ask":          ["enquire", "request", "seek to understand", "question", "raise"],
-        "tell":         ["communicate", "explain", "convey", "express", "articulate"],
-        "look":         ["examine", "review", "consider", "assess", "evaluate"],
-        "move":         ["shift", "transition", "progress", "advance", "relocate"],
-        "give":         ["provide", "offer", "supply", "present", "contribute"],
-        "take":         ["adopt", "accept", "assume", "undertake", "pursue"],
-        "put":          ["place", "position", "apply", "set", "establish"],
-        "come":         ["arrive", "emerge", "develop", "result", "follow"],
-        "go":           ["proceed", "advance", "move forward", "progress", "head"],
-        "seem":         ["appear", "look", "feel", "suggest", "indicate"],
-        "become":       ["develop into", "emerge as", "grow to be", "transform into", "evolve into"],
         "high":         ["elevated", "significant", "considerable", "substantial", "notable"],
         "low":          ["limited", "modest", "reduced", "minimal", "slight"],
-        "long":         ["extended", "prolonged", "lengthy", "sustained", "enduring"],
-        "short":        ["brief", "limited", "concise", "compact", "narrow"],
-        "hard":         ["demanding", "challenging", "strenuous", "difficult", "rigorous"],
-        "soft":         ["gentle", "flexible", "measured", "moderate", "careful"],
         "real":         ["genuine", "authentic", "actual", "true", "tangible"],
         "great":        ["considerable", "substantial", "significant", "impressive", "notable"],
-        "full":         ["complete", "comprehensive", "thorough", "total", "whole"],
-        "free":         ["unrestricted", "open", "accessible", "available", "unconstrained"],
         "simple":       ["straightforward", "basic", "clear", "accessible", "uncomplicated"],
         "complex":      ["intricate", "nuanced", "multifaceted", "elaborate", "layered"],
-        "important":    ["crucial", "significant", "essential", "key", "fundamental"],
         "possible":     ["feasible", "achievable", "viable", "realistic", "attainable"],
         "able":         ["capable", "equipped", "positioned", "prepared", "ready"],
         "known":        ["recognised", "established", "documented", "identified", "acknowledged"],
@@ -3386,12 +4918,18 @@ class SentenceGenerator:
                 words[i] = replacement + punct
         return " ".join(words)
 
-    @staticmethod
-    def _capitalise_clean(text: str) -> str:
+    _SENTENCE_START_RE = re.compile(r"([.!?]\s+)([a-z])")
+
+    @classmethod
+    def _capitalise_clean(cls, text: str) -> str:
         text = text.strip()
         if not text:
             return text
         text = text[0].upper() + text[1:]
+        # Openers that are whole sentences leave the next clause lowercase.
+        text = cls._SENTENCE_START_RE.sub(
+            lambda m: m.group(1) + m.group(2).upper(), text
+        )
         if text[-1] not in ".!?":
             text += "."
         while "  " in text:
@@ -3404,5 +4942,4 @@ class SentenceGenerator:
 
     @staticmethod
     def _is_safe(text: str) -> bool:
-        lower = text.lower()
-        return not any(term in lower for term in _BLOCKED_TERMS)
+        return not _BLOCKED_RE.search(text)
