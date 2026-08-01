@@ -87,7 +87,10 @@ def run(config: GeneratorConfig) -> None:
         config.rows_per_chunk,
     )
 
-    gen = SentenceGenerator(seed=config.seed)
+    gen = SentenceGenerator(seed=config.seed,
+                            seen_hashes_file=config.seen_hashes_path,
+                            categories=config.categories)
+    logger.info("Content selection: %s", gen.describe_selection())
     row_stream = gen.stream(config.total_rows)
 
     global_bar = _make_bar(config.total_rows, "Total rows", leave=True)
@@ -105,7 +108,7 @@ def run(config: GeneratorConfig) -> None:
         filepath = config.chunk_filename(chunk_idx)
 
         with open(filepath, "w", encoding="utf-8", buffering=_IO_BUFFER_BYTES) as fh:
-            chunk_bar = _make_bar(chunk_size, f"eng_L_{chunk_idx:03d}.txt", leave=False)
+            chunk_bar = _make_bar(chunk_size, filepath.name, leave=False)
 
             rows_written = 0
             for row in _take(row_stream, chunk_size):
@@ -122,6 +125,17 @@ def run(config: GeneratorConfig) -> None:
     global_bar.close()
     logger.info("Generation complete. %d rows written to %s", written_total, config.output_dir)
     print(f"\n✅  Done! {written_total:,} rows → {config.num_chunks} files in '{config.output_dir}'")
+
+
+def preview(config: GeneratorConfig) -> None:
+    """Print sample sentences for the chosen categories. Writes nothing."""
+    gen = SentenceGenerator(seed=config.seed, categories=config.categories)
+    print(f"  Selection : {gen.describe_selection()}")
+    print("-" * 68)
+    for row in gen.stream(config.preview):
+        print(f"  {row.id:>3}. {row.english_text}")
+    print("-" * 68)
+    print("  Preview only — no files were written.")
 
 
 # ---------------------------------------------------------------------------
